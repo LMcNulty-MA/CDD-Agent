@@ -1,0 +1,71 @@
+Guidelines for Adding Data Content to the CDD Data Model
+========================================================
+
+When adding or defining data attributes within the CDD data model, follow these guidelines to ensure consistency and clarity:
+
+General Principles
+------------------
+- Use standardized vocabularies and ontologies to annotate data attributes for clear and unambiguous semantics.
+- Choose a level of granularity that captures essential information without unnecessary complexity.
+- Clearly specify data types and formats, using standardized options whenever possible.
+- Avoid acronyms; spell out attribute/category names unless the acronym is widely recognized.
+- Attribute physical names must be less than 64 characters.
+- Attribute names should be written in camelCase.
+- Use descriptive names that reflect the content or purpose; avoid abbreviations and overly technical terms.
+
+Attribute Table Columns
+----------------------
+- **Attribute Name**
+- **Data Type**
+- **Comments**
+- **Example**
+
+Data Types and Guidelines
+-------------------------
+
+### STRING
+- For variable-length character strings (e.g., names, addresses, alphanumeric data).
+- Use for enumerations; list valid values in the attribute description unless using external codes (e.g., NAICs, ISO).
+- Example: `entityIncorporationName`, `internalRatingInitial`
+- Example description: `"rwaModelName" = User supplied. Note: rwaModelName must map with the modelName entered into instrumentRiskMetric.csv.`
+
+### DECIMAL
+- For numeric values with fixed precision and scale (e.g., rates, percentages as decimals).
+- Do not express attributes as percentages; use decimal format (e.g., 10% as 0.1).
+- Example: `interestRate`, `annualUsage`
+- Example description: `"annualUsage" = The annual rate the borrower would take from the Home Equity Line of Credit after the loan is originated. Valid values are between 0 and 1. Expressed in decimal format. For example, 10% is 0.1.`
+
+### INTEGER
+- For whole numbers without decimal points (e.g., counts, quantities, identifiers).
+- Express units in the description (e.g., years, months, days).
+- Example: `rbcRatingOrder`, `refundPeriod`
+- Example description: `"refundPeriod" = Time from origination over which Upfront Premium may be refunded pro-rata. Expressed in whole months. For example, 1 month is 1. Valid values are 1 or greater.`
+
+### DATE
+- For calendar dates without a time component.
+- Attribute names should include "Date" to indicate date-related fields.
+- Specify the format: `YYYY-MM-DD`.
+- Example: `callDateNext`, `valueDate`, `amortizationStartDate`
+- Example description: `"amortizationStartDate" = The date of the first contractual principal payment. Formatted as yyyy-mm-dd.`
+
+### BOOLEAN
+- For binary true/false values.
+- Attribute names should use prefixes like `is`, `has`, etc. (e.g., `isActive`, `hasAccess`).
+- Avoid ambiguous names like `status`, `flag`, or `value`.
+- Convention: Valid values are TRUE or FALSE (case-insensitive).
+- Example: `principalHasCheckingAccount`
+- Example description: `Specifies whether the principal has a checking account. TRUE indicates the principal has a checking account. FALSE indicates that the principal does not. Leaving this blank indicates it was not answered.`
+
+### MONETARY
+- For monetary values (e.g., prices, costs, salaries, revenues).
+- Attribute names should include terms like "amount", "payment", or "price".
+- Example: `entityTotalEquityAmount`
+- Example description: `The retained profits and invested capital, representing the equity of the business. Expressed in the financial statement currency.`
+
+### TIMESTAMP
+- For system-generated fields representing points in time or time intervals (not user input).
+- Format: `YYYY-MM-DD hh:mm:ss.sss` (up to milliseconds).
+
+Summary
+-------
+Follow these guidelines to ensure that all data attributes in the CDD data model are consistent, clear, and easy to interpret. Use the provided examples and conventions for each data type.

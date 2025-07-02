@@ -1,0 +1,11 @@
+
+        Field: TypeLoan
+        ZM Info: Data Tool Field=TypeLoan, Grid Tab=Loan Info, Grid Name=LoanType, InstDetail=N/A, Desc=Set the type of loan.  
+Standard = conventional amortizing instruments: use PrincipalSwitch to trigger the form of principal payments. 
+OptionARM = option ARM type adjustable rate mortgage loans, 
+Student = student loans.  , Char Limit=50.0, Inst Type=Loan
+        Feedback: 
+        Provide a concise definition, retaining all critical context from ZM Info. Adjust based on feedback, ensuring ALM relevance if applicable, and keep it brief.
+        - Consolidate as briefly as possible while retaining context of provided definition, some will be very lengthy but the context is required.
+        - Do not include the field name at the start of the definition. This is being saved to an .xlsx where the field name is the cell to the left, so that is redundant.
+        

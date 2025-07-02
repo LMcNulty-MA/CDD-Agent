@@ -1,0 +1,2 @@
+Category, Attribute, Description, Label, Tag, New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW), Partition Key Order (NOTE: LEAVE EMPTY FOR NOW), Index Key (NOTE: LEAVE EMPTY FOR NOW)
+Technical Category Name (if one matches) otherwise propose a new one, Attributes ( the new attribute name), Description  the new description, Label the UI Label / name, Tag the product tag 
