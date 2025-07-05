@@ -11,6 +11,7 @@ from .models import (
     NewCDDFieldSuggestion,
     EnrichedCDDAttribute
 )
+from .prompts import get_prompt_builder, get_system_message
 
 logger = logging.getLogger(__name__)
 
@@ -97,37 +98,21 @@ class CDDMappingAgent:
         
         cdd_context = await self.create_cdd_context()
         
-        prompt = f"""
-        You are an expert in financial data mapping and ALM (Asset Liability Management) systems.
-        
-        Field to Match: {field_name}
-        Field Definition: {field_definition}
-        
-        Available CDD Attributes:
-        {cdd_context}
-        
-        INSTRUCTIONS:
-        1. Find the top 3 BEST matches from the CDD attributes for this field
-        2. ONLY suggest matches that are highly likely to be semantically equivalent or very closely related
-        3. Consider both the field name and the definition/description when matching
-        4. For each match, provide a confidence score from 0.0 to 1.0
-        5. Return results as JSON array with fields: name, confidence_score, reasoning
-        6. If you cannot find any highly confident matches (>0.5), return empty array
-        
-        Focus on semantic meaning and financial/ALM relevance rather than exact string matching.
-        
-        Response format:
-        [
-            {{"name": "cdd_field_name", "confidence_score": 0.95, "reasoning": "explanation"}},
-            {{"name": "cdd_field_name", "confidence_score": 0.85, "reasoning": "explanation"}}
-        ]
-        """
+        # Use centralized prompt builder
+        prompt_builder = get_prompt_builder()
+        prompt = prompt_builder.build_field_matching_prompt(
+            field_name=field_name,
+            field_definition=field_definition,
+            context=cdd_context,
+            max_matches=3,
+            use_alm_format=True
+        )
         
         try:
             response = client.chat.completions.create(
                 model=settings.MODEL_TO_USE,
                 messages=[
-                    {"role": "system", "content": "You are a financial data mapping expert specializing in ALM and banking systems. Provide only valid JSON response."},
+                    {"role": "system", "content": get_system_message("financial_data_expert")},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=500,
@@ -167,48 +152,22 @@ class CDDMappingAgent:
         categories = await self.db_client.find_all("categories")
         category_context = "\n".join([f"• {cat['name']}: {cat.get('description', '')}" for cat in categories])
         
-        prompt = f"""
-        You are an expert in financial data mapping and CDD (Common Data Dictionary) design.
-        
-        Field to Create: {field_name}
-        Field Definition: {field_definition}
-        
-        Available CDD Categories:
-        {category_context}
-        
-        CDD Guidelines:
-        {self.cdd_guidelines}
-        
-        INSTRUCTIONS:
-        1. Create a new CDD field suggestion following the guidelines
-        2. Choose the most appropriate existing category or suggest a new one
-        3. Create a camelCase field name following naming conventions
-        4. Suggest appropriate data type based on the field definition
-        5. Create clear, professional description
-        6. Create user-friendly display label
-        
-        Return JSON response with fields:
-        - category: technical category name
-        - attribute: new camelCase attribute name
-        - description: professional description
-        - label: user-friendly display name
-        - data_type: suggested data type (STRING, DECIMAL, INTEGER, DATE, BOOLEAN, AMOUNT, TIMESTAMP)
-        
-        Response format:
-        {{
-            "category": "instrumentReference",
-            "attribute": "newFieldName",
-            "description": "Clear professional description...",
-            "label": "Display Name",
-            "data_type": "STRING"
-        }}
-        """
+        # Use centralized prompt builder
+        prompt_builder = get_prompt_builder()
+        prompt = prompt_builder.build_new_field_creation_prompt(
+            field_name=field_name,
+            field_definition=field_definition,
+            category_context=category_context,
+            tag="ZM",
+            feedback_context="",
+            use_alm_format=True
+        )
         
         try:
             response = client.chat.completions.create(
                 model=settings.MODEL_TO_USE,
                 messages=[
-                    {"role": "system", "content": "You are a financial data expert specializing in CDD design. Provide only valid JSON response."},
+                    {"role": "system", "content": get_system_message("cdd_field_expert")},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=500,

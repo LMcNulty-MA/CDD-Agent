@@ -7,14 +7,22 @@ focusing on single field checking functionality.
 
 import logging
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, status, Depends, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, status, Depends, Request, File, UploadFile, Form
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 import pandas as pd
 import io
+import uuid
+import json
+import os
+import tempfile
+from datetime import datetime
 
 from app.core.models import (
     SingleFieldCheckRequest, SingleFieldCheckResponse,
-    StandardFieldHeaders
+    StandardFieldHeaders, FileProcessingSession, FileUploadResponse,
+    ProcessFieldRequest, ProcessFieldResponse, SessionStatusResponse,
+    DownloadRequest, CDDMatchResult, NewCDDFieldSuggestion
 )
 from app.core.services import cdd_mapping_service
 from app.core.security import oauth2_scheme
@@ -22,6 +30,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# In-memory session storage (in production, use Redis or database)
+processing_sessions: Dict[str, Dict] = {}
 
 # Single Field Check Endpoint
 @router.post(
@@ -34,7 +45,7 @@ router = APIRouter()
 async def check_single_field(request: SingleFieldCheckRequest, token: str = Depends(oauth2_scheme)):
     """Check a single field against CDD attributes"""
     try:
-        logger.info(f"Checking field: {request.field_name}")
+        logger.info(f"Checking field: {request.field_name} with action: {request.action_type}")
         
         # Validate token is present (oauth2_scheme should handle this, but double-check)
         if not token:
@@ -46,10 +57,10 @@ async def check_single_field(request: SingleFieldCheckRequest, token: str = Depe
         
         # Use the service to check the field
         result = cdd_mapping_service.check_single_field(
-            request.field_name, 
-            request.field_definition,
-            force_new_suggestion=request.force_new_suggestion or False,
-            feedback_history=request.feedback_history
+            field_name=request.field_name,
+            field_definition=request.field_definition,
+            action_type=request.action_type or "find_matches",
+            feedback_text=request.feedback_text
         )
         
         logger.info(f"Field check completed with status: {result.status}")
@@ -142,6 +153,549 @@ async def get_example_file(format: str = "csv", token: str = Depends(oauth2_sche
             detail=f"Unable to generate example file: {str(e)}. Please try again or contact support."
         )
 
+# File Upload Endpoint
+@router.post(
+    "/upload-file",
+    summary="Upload File for Processing",
+    description="Upload a CSV or JSON file for batch field processing",
+    response_model=FileUploadResponse,
+    status_code=status.HTTP_200_OK
+)
+async def upload_file(
+    file: UploadFile = File(...),
+    token: str = Depends(oauth2_scheme)
+):
+    """Upload and process a file for CDD mapping"""
+    try:
+        # Validate token
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token is required.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        # Validate file type
+        if not file.filename or not file.filename.lower().endswith(('.csv', '.json')):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only CSV and JSON files are supported."
+            )
+        
+        # Read file content
+        content = await file.read()
+        
+        # Parse file based on extension
+        if file.filename and file.filename.lower().endswith('.json'):
+            try:
+                data = json.loads(content.decode('utf-8'))
+                df = pd.DataFrame(data)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid JSON format. Please check your file."
+                )
+        else:
+            # CSV file
+            try:
+                df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+            except UnicodeDecodeError:
+                # Try different encodings
+                for encoding in ['windows-1252', 'latin-1']:
+                    try:
+                        df = pd.read_csv(io.StringIO(content.decode(encoding)))
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Unable to read CSV file. Please check the file encoding."
+                    )
+        
+        # Standardize column names (same logic as cdd_mapping.py)
+        column_mapping = {}
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if any(term in col_lower for term in ['field', 'name']) and 'context' not in col_lower and 'cdd' not in col_lower:
+                column_mapping[col] = StandardFieldHeaders.FIELD_NAME.value
+            elif any(term in col_lower for term in ['context', 'definition', 'description', 'notes']) and 'cdd' not in col_lower:
+                column_mapping[col] = StandardFieldHeaders.CONTEXT_DEFINITION.value
+            elif 'cdd_confirmed' in col_lower or 'confirmed' in col_lower:
+                column_mapping[col] = StandardFieldHeaders.CDD_CONFIRMED.value
+            elif 'cdd_best_guess' in col_lower or 'best_guess' in col_lower or ('cdd' in col_lower and any(term in col_lower for term in ['field', 'name', 'guess'])):
+                column_mapping[col] = StandardFieldHeaders.CDD_BEST_GUESS.value
+        
+        # Rename columns to standard format
+        df = df.rename(columns=column_mapping)
+        
+        # Validate required columns
+        required_cols = [StandardFieldHeaders.FIELD_NAME.value, StandardFieldHeaders.CONTEXT_DEFINITION.value]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing required columns: {missing_cols}. Expected: field_name, context_definition"
+            )
+        
+        # Add missing columns if not present
+        if StandardFieldHeaders.CDD_CONFIRMED.value not in df.columns:
+            df[StandardFieldHeaders.CDD_CONFIRMED.value] = ""
+        if StandardFieldHeaders.CDD_BEST_GUESS.value not in df.columns:
+            df[StandardFieldHeaders.CDD_BEST_GUESS.value] = ""
+        
+        # Convert to object dtype to avoid pandas warnings
+        df[StandardFieldHeaders.CDD_CONFIRMED.value] = df[StandardFieldHeaders.CDD_CONFIRMED.value].astype('object')
+        df[StandardFieldHeaders.CDD_BEST_GUESS.value] = df[StandardFieldHeaders.CDD_BEST_GUESS.value].astype('object')
+        
+        # Filter processable fields (same logic as cdd_mapping.py)
+        field_col = StandardFieldHeaders.FIELD_NAME.value
+        context_col = StandardFieldHeaders.CONTEXT_DEFINITION.value
+        confirmed_col = StandardFieldHeaders.CDD_CONFIRMED.value
+        best_guess_col = StandardFieldHeaders.CDD_BEST_GUESS.value
+        
+        skip_mask = (
+            (df[confirmed_col].notna() & (df[confirmed_col].astype(str).str.strip() != "")) |
+            (df[best_guess_col].notna() & (df[best_guess_col].astype(str).str.strip() != "")) |
+            (df[context_col].astype(str).str.contains("NEED REVIEW", case=False, na=False)) |
+            (df[field_col].isna() | (df[field_col].astype(str).str.strip() == "")) |
+            (df[context_col].isna() | (df[context_col].astype(str).str.strip() == ""))
+        )
+        
+        processable_df = df.loc[~skip_mask].copy()
+        
+        # Create session
+        session_id = str(uuid.uuid4())
+        
+        # Store session data
+        processing_sessions[session_id] = {
+            'session_id': session_id,
+            'original_filename': file.filename,
+            'original_df': df.to_dict('records'),
+            'processable_indices': processable_df.index.tolist(),
+            'current_index': 0,
+            'total_fields': len(df),
+            'processable_fields': len(processable_df),
+            'processed_fields': 0,
+            'status': 'active',
+            'created_at': datetime.now(),
+            'last_updated': datetime.now(),
+            'new_field_suggestions': []
+        }
+        
+        return FileUploadResponse(
+            session_id=session_id,
+            message=f"File uploaded successfully. {len(processable_df)} fields ready for processing.",
+            total_fields=len(df),
+            processable_fields=len(processable_df),
+            sample_fields=[]  # Removed confusing sample fields
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading file: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to process uploaded file: {str(e)}"
+        )
+
+# Get Next Field Endpoint
+@router.get(
+    "/session/{session_id}/next-field",
+    summary="Get Next Field to Process",
+    description="Get the next field in the session for processing",
+    status_code=status.HTTP_200_OK
+)
+async def get_next_field(session_id: str, token: str = Depends(oauth2_scheme)):
+    """Get the next field to process in the session"""
+    try:
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token is required.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        if session_id not in processing_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+        
+        session = processing_sessions[session_id]
+        
+        if session['current_index'] >= len(session['processable_indices']):
+            return {
+                'session_id': session_id,
+                'status': 'completed',
+                'progress': {
+                    'total': session['processable_fields'],
+                    'processed': session['processed_fields'],
+                    'remaining': 0
+                },
+                'current_field': None,
+                'can_download': True
+            }
+        
+        # Get current field
+        current_df_index = session['processable_indices'][session['current_index']]
+        current_row = session['original_df'][current_df_index]
+        
+        # Get matches for the current field automatically (per user workflow)
+        field_name = current_row[StandardFieldHeaders.FIELD_NAME.value]
+        field_definition = current_row[StandardFieldHeaders.CONTEXT_DEFINITION.value]
+        
+        # Use the service to get matches automatically
+        check_result = cdd_mapping_service.check_single_field(
+            field_name=field_name, 
+            field_definition=field_definition,
+            action_type="find_matches"
+        )
+        
+        return {
+            'session_id': session_id,
+            'status': 'active',
+            'progress': {
+                'total': session['processable_fields'],
+                'processed': session['processed_fields'],
+                'remaining': session['processable_fields'] - session['processed_fields']
+            },
+            'current_field': {
+                'index': session['current_index'],
+                'field_name': field_name,
+                'field_definition': field_definition,
+                'matches': [match.dict() for match in check_result.matches],
+                'new_field_suggestion': check_result.new_field_suggestion.dict() if check_result.new_field_suggestion else None,
+                'status': check_result.status
+            },
+            'can_download': session['processed_fields'] > 0
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting next field: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to get next field: {str(e)}"
+        )
+
+# Process Field Action Endpoint
+@router.post(
+    "/session/{session_id}/process-field",
+    summary="Process Field Action",
+    description="Process a field with the selected action (match, new_field, skip)",
+    status_code=status.HTTP_200_OK
+)
+async def process_field_action(
+    session_id: str,
+    action: str = Form(...),
+    selected_match: Optional[str] = Form(None),
+    new_field_json: Optional[str] = Form(None),
+    feedback_history: Optional[str] = Form(None),
+    token: str = Depends(oauth2_scheme)
+):
+    """Process a field action in the session"""
+    try:
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token is required.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        if session_id not in processing_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+        
+        session = processing_sessions[session_id]
+        
+        if session['current_index'] >= len(session['processable_indices']):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No more fields to process"
+            )
+        
+        # Get current field
+        current_df_index = session['processable_indices'][session['current_index']]
+        current_row = session['original_df'][current_df_index]
+        field_name = current_row[StandardFieldHeaders.FIELD_NAME.value]
+        
+        # Process the action
+        updated_value = None
+        
+        if action == 'match' and selected_match:
+            # Update with selected match
+            updated_value = selected_match
+            session['original_df'][current_df_index][StandardFieldHeaders.CDD_BEST_GUESS.value] = selected_match
+            
+        elif action == 'new_field':
+            # Handle new field creation
+            if new_field_json:
+                try:
+                    new_field_data = json.loads(new_field_json)
+                    # Store the new field suggestion
+                    session['new_field_suggestions'].append(new_field_data)
+                    updated_value = "NEW_FIELD_REQUESTED"
+                    session['original_df'][current_df_index][StandardFieldHeaders.CDD_BEST_GUESS.value] = "NEW_FIELD_REQUESTED"
+                except json.JSONDecodeError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid new field data format"
+                    )
+            else:
+                # Generate new field suggestion
+                field_definition = current_row[StandardFieldHeaders.CONTEXT_DEFINITION.value]
+                feedback_list = json.loads(feedback_history) if feedback_history else None
+                
+                check_result = cdd_mapping_service.check_single_field(
+                    field_name=field_name, 
+                    field_definition=field_definition, 
+                    action_type="create_new_field",
+                    feedback_text=feedback_history
+                )
+                
+                if check_result.new_field_suggestion:
+                    session['new_field_suggestions'].append(check_result.new_field_suggestion.dict())
+                    updated_value = "NEW_FIELD_REQUESTED"
+                    session['original_df'][current_df_index][StandardFieldHeaders.CDD_BEST_GUESS.value] = "NEW_FIELD_REQUESTED"
+                else:
+                    updated_value = "SKIP"
+                    session['original_df'][current_df_index][StandardFieldHeaders.CDD_BEST_GUESS.value] = "SKIP"
+                    
+        elif action == 'skip':
+            # Skip the field
+            updated_value = "SKIP"
+            session['original_df'][current_df_index][StandardFieldHeaders.CDD_BEST_GUESS.value] = "SKIP"
+        
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid action or missing required parameters"
+            )
+        
+        # Update session progress
+        session['processed_fields'] += 1
+        session['current_index'] += 1
+        session['last_updated'] = datetime.now()
+        
+        # Check if completed
+        if session['current_index'] >= len(session['processable_indices']):
+            session['status'] = 'completed'
+        
+        return {
+            'session_id': session_id,
+            'field_index': session['current_index'] - 1,
+            'field_name': field_name,
+            'action_taken': action,
+            'updated_value': updated_value,
+            'progress': {
+                'total': session['processable_fields'],
+                'processed': session['processed_fields'],
+                'remaining': session['processable_fields'] - session['processed_fields']
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing field action: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to process field action: {str(e)}"
+        )
+
+# Download Files Endpoint
+@router.get(
+    "/session/{session_id}/download",
+    summary="Download Processed Files",
+    description="Download the updated input file and new field suggestions",
+    status_code=status.HTTP_200_OK
+)
+async def download_files(
+    session_id: str,
+    file_type: str,
+    format: str = "csv",
+    token: str = Depends(oauth2_scheme)
+):
+    """Download processed files from the session"""
+    try:
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token is required.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        if session_id not in processing_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+        
+        session = processing_sessions[session_id]
+        
+        if file_type == "updated_input":
+            # Return updated input file
+            df = pd.DataFrame(session['original_df'])
+            
+            if format == "json":
+                content = df.to_json(orient='records', indent=2)
+                media_type = "application/json"
+                filename = f"updated_{session['original_filename'].rsplit('.', 1)[0]}.json"
+            else:
+                content = df.to_csv(index=False)
+                media_type = "text/csv"
+                filename = f"updated_{session['original_filename'].rsplit('.', 1)[0]}.csv"
+                
+        elif file_type == "new_fields":
+            # Return new field suggestions
+            if not session['new_field_suggestions']:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No new field suggestions available"
+                )
+            
+            # Format new field suggestions with proper column names
+            formatted_suggestions = []
+            for suggestion in session['new_field_suggestions']:
+                formatted_suggestion = {
+                    "Category": suggestion.get('category', ''),
+                    "Attribute": suggestion.get('attribute', ''),
+                    "Description": suggestion.get('description', ''),
+                    "Label": suggestion.get('label', ''),
+                    "Tag": suggestion.get('tag', settings.DEFAULT_LABEL_TAG),
+                    "New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW)": "New",
+                    "Partition Key Order (NOTE: LEAVE EMPTY FOR NOW)": "",
+                    "Index Key (NOTE: LEAVE EMPTY FOR NOW)": ""
+                }
+                formatted_suggestions.append(formatted_suggestion)
+            
+            df = pd.DataFrame(formatted_suggestions)
+            
+            if format == "json":
+                content = df.to_json(orient='records', indent=2)
+                media_type = "application/json"
+                filename = f"new_field_suggestions_{session_id[:8]}.json"
+            else:
+                content = df.to_csv(index=False)
+                media_type = "text/csv"
+                filename = f"new_field_suggestions_{session_id[:8]}.csv"
+        
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid file_type. Must be 'updated_input' or 'new_fields'"
+            )
+        
+        return StreamingResponse(
+            io.StringIO(content),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading files: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to download files: {str(e)}"
+        )
+
+# Download Single Field New Field Suggestion Endpoint
+@router.post(
+    "/download-single-field-suggestion",
+    summary="Download Single Field New Field Suggestion",
+    description="Download a new field suggestion for a single field in CSV or JSON format",
+    status_code=status.HTTP_200_OK
+)
+async def download_single_field_suggestion(
+    field_name: str = Form(...),
+    field_definition: str = Form(...),
+    new_field_json: str = Form(...),
+    format: str = Form("csv"),
+    token: str = Depends(oauth2_scheme)
+):
+    """Download a single field's new field suggestion"""
+    try:
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authentication token is required.",
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+        
+        # Parse the new field data
+        try:
+            new_field_data = json.loads(new_field_json)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid new field data format"
+            )
+        
+        # Format the new field suggestion with proper column names for template
+        formatted_suggestion = {
+            "Category": new_field_data.get('category', ''),
+            "Attribute": new_field_data.get('attribute', ''),
+            "Description": new_field_data.get('description', ''),
+            "Label": new_field_data.get('label', ''),
+            "Tag": new_field_data.get('tag', settings.DEFAULT_LABEL_TAG),
+            "New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW)": "New",
+            "Partition Key Order (NOTE: LEAVE EMPTY FOR NOW)": "",
+            "Index Key (NOTE: LEAVE EMPTY FOR NOW)": "",
+            "Data Type": new_field_data.get('data_type', 'STRING'),
+            "Original Field Name": field_name,
+            "Original Field Definition": field_definition,
+            "Created At": datetime.now().isoformat()
+        }
+        
+        # Create file content
+        if format == "json":
+            content = json.dumps([formatted_suggestion], indent=2)
+            media_type = "application/json"
+            filename = f"new_field_suggestion_{field_name.replace(' ', '_')}.json"
+        else:
+            df = pd.DataFrame([formatted_suggestion])
+            content = df.to_csv(index=False)
+            media_type = "text/csv"
+            filename = f"new_field_suggestion_{field_name.replace(' ', '_')}.csv"
+        
+        return StreamingResponse(
+            io.StringIO(content),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading single field suggestion: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to download field suggestion: {str(e)}"
+        )
+
+# Static file serving routes
+@router.get("/static/css/{file_path:path}")
+async def serve_css(file_path: str):
+    """Serve CSS files"""
+    return FileResponse(f"app/static/css/{file_path}")
+
+@router.get("/static/js/{file_path:path}")
+async def serve_js(file_path: str):
+    """Serve JavaScript files"""
+    return FileResponse(f"app/static/js/{file_path}")
+
+@router.get("/static/html/{file_path:path}")
+async def serve_html(file_path: str):
+    """Serve HTML files"""
+    return FileResponse(f"app/static/html/{file_path}")
+
 # Web Interface HTML Page
 @router.get(
     "/",
@@ -152,1203 +706,4 @@ async def get_example_file(format: str = "csv", token: str = Depends(oauth2_sche
 )
 async def web_interface():
     """Serve the main web interface"""
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>CDD Field Mapping Tool</title>
-        <style>
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }
-            
-            body {
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                color: #333;
-                transition: all 0.3s ease;
-            }
-            
-            /* Theme toggle button (same as Swagger UI) */
-            .theme-switch-container {
-                position: fixed;
-                top: 10px;
-                right: 20px;
-                z-index: 1000;
-                display: flex;
-                align-items: center;
-            }
-            .theme-switch-label {
-                margin-right: 10px;
-                color: #fff;
-                font-weight: 500;
-                font-size: 14px;
-            }
-            .theme-switch {
-                position: relative;
-                display: inline-block;
-                width: 60px;
-                height: 34px;
-            }
-            .theme-switch input {
-                opacity: 0;
-                width: 0;
-                height: 0;
-            }
-            .slider {
-                position: absolute;
-                cursor: pointer;
-                top: 0;
-                left: 0;
-                right: 0;
-                bottom: 0;
-                background-color: #ccc;
-                transition: .4s;
-                border-radius: 34px;
-            }
-            .slider:before {
-                position: absolute;
-                content: "";
-                height: 26px;
-                width: 26px;
-                left: 4px;
-                bottom: 4px;
-                background-color: white;
-                transition: .4s;
-                border-radius: 50%;
-            }
-            input:checked + .slider {
-                background-color: #2196F3;
-            }
-            input:checked + .slider:before {
-                transform: translateX(26px);
-            }
-            
-            /* Dark theme styles */
-            body.dark-theme {
-                background: linear-gradient(135deg, #1e1e1e 0%, #2d2d2d 100%);
-                color: #ffffff;
-            }
-            
-            .dark-theme .theme-switch-label {
-                color: #ffffff;
-            }
-            
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 20px;
-            }
-            
-            .header {
-                text-align: center;
-                color: white;
-                margin-bottom: 30px;
-            }
-            
-            .header h1 {
-                font-size: 2.5rem;
-                margin-bottom: 10px;
-                text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-            }
-            
-            .header p {
-                font-size: 1.1rem;
-                opacity: 0.9;
-            }
-            
-            .card {
-                background: white;
-                border-radius: 15px;
-                padding: 30px;
-                margin-bottom: 20px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-                transition: all 0.3s ease;
-            }
-            
-            .card:hover {
-                transform: translateY(-5px);
-            }
-            
-            .dark-theme .card {
-                background: #252526;
-                border: 1px solid #444444;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-            }
-            
-            .dark-theme .header h1,
-            .dark-theme .header p {
-                color: #ffffff;
-            }
-            
-            .auth-section {
-                margin-bottom: 30px;
-            }
-            
-            .auth-section h2 {
-                color: #4a5568;
-                margin-bottom: 15px;
-                display: flex;
-                align-items: center;
-            }
-            
-            .auth-section h2::before {
-                content: "🔐";
-                margin-right: 10px;
-            }
-            
-            .form-group {
-                margin-bottom: 20px;
-            }
-            
-            .form-group label {
-                display: block;
-                margin-bottom: 5px;
-                font-weight: 600;
-                color: #4a5568;
-            }
-            
-            .form-group input, .form-group textarea, .form-group select {
-                width: 100%;
-                padding: 12px;
-                border: 2px solid #e2e8f0;
-                border-radius: 8px;
-                font-size: 14px;
-                transition: border-color 0.3s ease;
-            }
-            
-            .form-group input:focus, .form-group textarea:focus, .form-group select:focus {
-                outline: none;
-                border-color: #667eea;
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            }
-            
-            .dark-theme .auth-section h2,
-            .dark-theme .form-group label {
-                color: #ffffff;
-            }
-            
-            .dark-theme .form-group input,
-            .dark-theme .form-group textarea,
-            .dark-theme .form-group select {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border-color: #444444;
-            }
-            
-            .dark-theme .form-group input:focus,
-            .dark-theme .form-group textarea:focus,
-            .dark-theme .form-group select:focus {
-                border-color: #2196F3;
-                box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.1);
-            }
-            
-            .btn {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-                border: none;
-                padding: 12px 24px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: 600;
-                transition: all 0.3s ease;
-                text-decoration: none;
-                display: inline-block;
-                margin-right: 10px;
-                margin-bottom: 10px;
-            }
-            
-            .btn:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            }
-            
-            .btn-secondary {
-                background: #718096;
-            }
-            
-            .btn-success {
-                background: #48bb78;
-            }
-            
-            .btn-danger {
-                background: #f56565;
-            }
-            
-            .match-item {
-                border: 1px solid #e2e8f0;
-                border-radius: 6px;
-                padding: 15px;
-                margin-bottom: 10px;
-                cursor: pointer;
-                transition: all 0.3s ease;
-            }
-            
-            .match-item:hover {
-                border-color: #667eea;
-                background: #f0f4ff;
-            }
-            
-            .match-item.selected {
-                border-color: #667eea;
-                background: #e6fffa;
-            }
-            
-            .dark-theme .match-item {
-                background: #1a1a1a;
-                border-color: #444444;
-                color: #ffffff;
-            }
-            
-            .dark-theme .match-item:hover {
-                border-color: #2196F3;
-                background: #2d2d2d;
-            }
-            
-            .dark-theme .match-item.selected {
-                border-color: #2196F3;
-                background: #1e3a5f;
-            }
-            
-            /* Alert styles */
-            .alert {
-                padding: 15px;
-                margin: 10px 0;
-                border-radius: 6px;
-                border: 1px solid transparent;
-            }
-            
-            .alert-success {
-                background-color: #d4edda;
-                border-color: #c3e6cb;
-                color: #155724;
-            }
-            
-            .alert-error {
-                background-color: #f8d7da;
-                border-color: #f5c6cb;
-                color: #721c24;
-            }
-            
-            .alert-info {
-                background-color: #d1ecf1;
-                border-color: #bee5eb;
-                color: #0c5460;
-            }
-            
-            .dark-theme .alert-success {
-                background-color: #1e3a2e;
-                border-color: #2d5a3d;
-                color: #4ade80;
-            }
-            
-            .dark-theme .alert-error {
-                background-color: #3a1e1e;
-                border-color: #5a2d2d;
-                color: #f87171;
-            }
-            
-            .dark-theme .alert-info {
-                background-color: #1e2a3a;
-                border-color: #2d3d5a;
-                color: #60a5fa;
-            }
-            
-            /* Match item styling */
-            .match-meta {
-                color: #718096;
-            }
-            
-            .match-description {
-                color: #4a5568;
-            }
-            
-            .dark-theme .match-meta {
-                color: #a0aec0;
-            }
-            
-            .dark-theme .match-description {
-                color: #e2e8f0;
-            }
-            
-            /* New field suggestion styling */
-            .suggestion-container {
-                border: 1px solid #e2e8f0;
-                border-radius: 8px;
-                padding: 20px;
-                margin-top: 15px;
-                background: #f7fafc;
-            }
-            
-            .dark-theme .suggestion-container {
-                background: #2d2d2d;
-                border-color: #444444;
-            }
-            
-            .suggestion-field {
-                margin-bottom: 10px;
-                font-size: 14px;
-            }
-            
-            .suggestion-field strong {
-                color: #2d3748;
-            }
-            
-            .dark-theme .suggestion-field strong {
-                color: #e2e8f0;
-            }
-            
-            .suggestion-field .field-value {
-                color: #4a5568;
-            }
-            
-            .dark-theme .suggestion-field .field-value {
-                color: #a0aec0;
-            }
-            
-            .dark-theme .suggestion-container > div:last-child {
-                border-top-color: #444444 !important;
-            }
-            
-            /* Generate new field section styling */
-            .generate-new-section {
-                background: #f8f9fa;
-                border-left: 4px solid #667eea;
-            }
-            
-            .dark-theme .generate-new-section {
-                background: #2d2d2d;
-                border-left-color: #2196F3;
-            }
-            
-            .dark-theme .generate-new-section p {
-                color: #a0aec0 !important;
-            }
-            
-            /* Modal styling */
-            .modal-overlay {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0, 0, 0, 0.5);
-                z-index: 1000;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-            
-            .modal-content {
-                background: white;
-                padding: 30px;
-                border-radius: 12px;
-                max-width: 600px;
-                width: 90%;
-                max-height: 80vh;
-                overflow-y: auto;
-                box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-            }
-            
-            .modal-header {
-                margin-top: 0;
-                color: #2d3748;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-            
-            .modal-description {
-                color: #4a5568;
-                margin-bottom: 20px;
-                line-height: 1.5;
-            }
-            
-            .modal-textarea {
-                width: 100%;
-                padding: 12px;
-                border: 2px solid #e2e8f0;
-                border-radius: 8px;
-                font-size: 14px;
-                resize: vertical;
-                font-family: inherit;
-                transition: border-color 0.3s ease;
-            }
-            
-            .modal-textarea:focus {
-                outline: none;
-                border-color: #667eea;
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            }
-            
-            .modal-footer {
-                margin-top: 20px;
-                text-align: right;
-                display: flex;
-                gap: 10px;
-                justify-content: flex-end;
-            }
-            
-            .modal-btn {
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: 600;
-                transition: all 0.3s ease;
-            }
-            
-            .modal-btn-cancel {
-                background: #718096;
-                color: white;
-            }
-            
-            .modal-btn-cancel:hover {
-                background: #4a5568;
-            }
-            
-            .modal-btn-submit {
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-            }
-            
-            .modal-btn-submit:hover {
-                transform: translateY(-1px);
-                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-            }
-            
-            /* Dark mode modal styling */
-            .dark-theme .modal-overlay {
-                background: rgba(0, 0, 0, 0.7);
-            }
-            
-            .dark-theme .modal-content {
-                background: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #444444;
-            }
-            
-            .dark-theme .modal-header {
-                color: #ffffff;
-            }
-            
-            .dark-theme .modal-description {
-                color: #a0aec0;
-            }
-            
-            .dark-theme .modal-textarea {
-                background: #1a1a1a;
-                color: #ffffff;
-                border-color: #444444;
-            }
-            
-            .dark-theme .modal-textarea:focus {
-                border-color: #2196F3;
-                box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.1);
-            }
-            
-            .dark-theme .modal-btn-cancel {
-                background: #4a5568;
-                color: #ffffff;
-            }
-            
-            .dark-theme .modal-btn-cancel:hover {
-                background: #2d3748;
-            }
-            
-            .confidence-score {
-                display: inline-block;
-                padding: 4px 8px;
-                border-radius: 12px;
-                font-size: 12px;
-                font-weight: 600;
-                color: white;
-            }
-            
-            .confidence-high { background: #48bb78; }
-            .confidence-medium { background: #ed8936; }
-            .confidence-low { background: #f56565; }
-            
-            .hidden {
-                display: none !important;
-            }
-            
-            .alert {
-                padding: 12px;
-                border-radius: 6px;
-                margin-bottom: 15px;
-            }
-            
-            .alert-success {
-                background: #c6f6d5;
-                color: #22543d;
-                border: 1px solid #9ae6b4;
-            }
-            
-            .alert-error {
-                background: #fed7d7;
-                color: #742a2a;
-                border: 1px solid #fc8181;
-            }
-            
-            .alert-info {
-                background: #bee3f8;
-                color: #2a4365;
-                border: 1px solid #90cdf4;
-            }
-            
-            .loading {
-                display: inline-block;
-                width: 20px;
-                height: 20px;
-                border: 3px solid #f3f3f3;
-                border-top: 3px solid #667eea;
-                border-radius: 50%;
-                animation: spin 1s linear infinite;
-            }
-            
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-        </style>
-    </head>
-    <body>
-        <div class="theme-switch-container">
-            <span class="theme-switch-label">Dark Mode</span>
-            <label class="theme-switch">
-                <input type="checkbox" id="theme-toggle">
-                <span class="slider"></span>
-            </label>
-        </div>
-        
-        <div class="container">
-            <div class="header">
-                <h1>🎯 CDD Field Mapping Tool</h1>
-                <p>Intelligent mapping of your fields to Common Data Dictionary attributes</p>
-            </div>
-            
-            <!-- Authentication Section -->
-            <div class="card auth-section">
-                <h2>Authentication</h2>
-                <div class="form-group">
-                    <label for="authToken">Authentication Token:</label>
-                    <input type="password" id="authToken" placeholder="Enter your authentication token">
-                </div>
-                <button class="btn" onclick="authenticateUser()">
-                    <span id="authLoadingIcon" class="loading hidden"></span>
-                    Authenticate
-                </button>
-                <div id="authStatus" class="hidden"></div>
-            </div>
-            
-            <!-- Main Interface (hidden until authenticated) -->
-            <div id="mainInterface" class="hidden">
-                <div class="card">
-                    <h2>🔍 Check Single Field</h2>
-                    <p style="margin-bottom: 20px; color: #718096;">
-                        Test a single field against the CDD database to see potential matches or get suggestions for new fields.
-                        <br><a href="#" onclick="downloadExampleFile('csv')" style="color: #667eea;">Download CSV example</a> | 
-                        <a href="#" onclick="downloadExampleFile('json')" style="color: #667eea;">Download JSON example</a>
-                    </p>
-                    
-                    <div class="form-group">
-                        <label for="fieldName">Field Name:</label>
-                        <input type="text" id="fieldName" placeholder="e.g., LoanAmount, InterestRate">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="fieldDefinition">Field Definition/Description:</label>
-                        <textarea id="fieldDefinition" rows="3" placeholder="Describe what this field represents..."></textarea>
-                    </div>
-                    
-                    <button class="btn" onclick="checkSingleField()">
-                        <span id="singleCheckLoadingIcon" class="loading hidden"></span>
-                        Check Field
-                    </button>
-                    
-                    <div id="singleFieldStatus" class="alert hidden"></div>
-                    
-                    <div id="singleFieldResults" class="hidden">
-                        <h3>Results:</h3>
-                        <div id="singleFieldContent"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <script>
-            // Global variables
-            let authToken = '';
-            
-            // Theme toggle functionality (same as Swagger UI)
-            const themeToggle = document.getElementById('theme-toggle');
-            
-            // Check for saved theme preference or prefer-color-scheme
-            const prefersDarkScheme = window.matchMedia('(prefers-color-scheme: dark)');
-            const savedTheme = localStorage.getItem('cdd-agent-web-theme');
-            
-            if (savedTheme === 'dark' || (!savedTheme && prefersDarkScheme.matches)) {
-                document.body.classList.add('dark-theme');
-                themeToggle.checked = true;
-            }
-            
-            // Add toggle event
-            themeToggle.addEventListener('change', function() {
-                if (this.checked) {
-                    document.body.classList.add('dark-theme');
-                    localStorage.setItem('cdd-agent-web-theme', 'dark');
-                } else {
-                    document.body.classList.remove('dark-theme');
-                    localStorage.setItem('cdd-agent-web-theme', 'light');
-                }
-            });
-            
-            // Listen for system theme changes
-            prefersDarkScheme.addEventListener('change', function(e) {
-                const savedTheme = localStorage.getItem('cdd-agent-web-theme');
-                if (!savedTheme) {
-                    if (e.matches) {
-                        document.body.classList.add('dark-theme');
-                        themeToggle.checked = true;
-                    } else {
-                        document.body.classList.remove('dark-theme');
-                        themeToggle.checked = false;
-                    }
-                }
-            });
-            
-            // Authentication
-            async function authenticateUser() {
-                const token = document.getElementById('authToken').value.trim();
-                if (!token) {
-                    showAlert('authStatus', 'Please enter an authentication token', 'error');
-                    return;
-                }
-                
-                showLoading('authLoadingIcon', true);
-                
-                try {
-                    // Test authentication by making a simple API call
-                    const response = await fetch('/cdd-agent/categories', {
-                        headers: {
-                            'Authorization': `Bearer ${token}`
-                        }
-                    });
-                    
-                    if (response.ok) {
-                        authToken = token;
-                        showAlert('authStatus', 'Authentication successful!', 'success');
-                        document.getElementById('mainInterface').classList.remove('hidden');
-                    } else {
-                        const errorData = await response.json().catch(() => ({}));
-                        let errorMessage = 'Authentication failed';
-                        
-                        if (response.status === 401 || response.status === 403) {
-                            errorMessage = 'Invalid authentication token. Please check your token and try again.';
-                        } else if (errorData.detail) {
-                            errorMessage = errorData.detail;
-                        } else if (response.status === 422) {
-                            errorMessage = 'There was an issue with your request. Please try again.';
-                        }
-                        
-                        showAlert('authStatus', errorMessage, 'error');
-                    }
-                } catch (error) {
-                    console.error('Authentication error:', error);
-                    showAlert('authStatus', 'Unable to connect to the server. Please check your connection and try again.', 'error');
-                }
-                
-                showLoading('authLoadingIcon', false);
-            }
-            
-            // Single field check
-            async function checkSingleField() {
-                const fieldName = document.getElementById('fieldName').value.trim();
-                const fieldDefinition = document.getElementById('fieldDefinition').value.trim();
-                
-                if (!fieldName || !fieldDefinition) {
-                    showAlert('singleFieldStatus', 'Please enter both field name and definition', 'error');
-                    return;
-                }
-                
-                showLoading('singleCheckLoadingIcon', true);
-                
-                try {
-                    const response = await fetch('/cdd-agent/web/check-field', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${authToken}`
-                        },
-                        body: JSON.stringify({
-                            field_name: fieldName,
-                            field_definition: fieldDefinition
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        displaySingleFieldResults(result);
-                    } else {
-                        let errorMessage = 'An error occurred while checking the field';
-                        
-                        if (response.status === 401 || response.status === 403) {
-                            errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                            // Hide main interface and show auth section
-                            document.getElementById('mainInterface').classList.add('hidden');
-                            authToken = null;
-                        } else if (result.detail) {
-                            errorMessage = result.detail;
-                        }
-                        
-                        showAlert('singleFieldStatus', errorMessage, 'error');
-                    }
-                } catch (error) {
-                    console.error('Field check error:', error);
-                    showAlert('singleFieldStatus', 'Unable to connect to the server. Please check your connection and try again.', 'error');
-                }
-                
-                showLoading('singleCheckLoadingIcon', false);
-            }
-            
-            function displaySingleFieldResults(result) {
-                const resultsDiv = document.getElementById('singleFieldResults');
-                const contentDiv = document.getElementById('singleFieldContent');
-                
-                let html = `
-                    <div class="alert alert-info">
-                        <strong>Status:</strong> ${result.status} 
-                        (Confidence threshold: ${result.confidence_threshold})
-                    </div>
-                `;
-                
-                if (result.matches && result.matches.length > 0) {
-                    html += '<h4>🎯 Potential Matches:</h4>';
-                    html += '<div style="max-height: 400px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; margin-bottom: 20px;">';
-                    result.matches.forEach(match => {
-                        const confidenceClass = match.confidence_score >= 0.8 ? 'confidence-high' : 
-                                               match.confidence_score >= 0.6 ? 'confidence-medium' : 'confidence-low';
-                        
-                        html += `
-                            <div class="match-item" style="margin-bottom: 15px; padding: 15px; border: 1px solid #e2e8f0; border-radius: 6px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                    <strong style="word-break: break-word; flex: 1; margin-right: 10px;">${match.cdd_field}</strong>
-                                    <span class="confidence-score ${confidenceClass}" style="flex-shrink: 0;">
-                                        ${Math.round(match.confidence_score * 100)}%
-                                    </span>
-                                </div>
-                                <div class="match-meta" style="margin-bottom: 8px; font-size: 14px;">
-                                    <strong>Category:</strong> ${match.category || 'N/A'} | 
-                                    <strong>Type:</strong> ${match.data_type || 'N/A'}
-                                </div>
-                                <div class="match-description" style="font-size: 14px; line-height: 1.4; word-wrap: break-word;">
-                                    ${match.description || 'No description available'}
-                                </div>
-                            </div>
-                        `;
-                    });
-                    html += '</div>';
-                    
-                    // Add "Generate New Field" button if there are matches but user might not like them
-                    html += `
-                        <div class="generate-new-section" style="margin-top: 15px; padding: 15px; border-radius: 8px;">
-                            <p style="margin: 0 0 10px 0; color: #4a5568; font-size: 14px;">
-                                Don't see a good match? Generate a new CDD field suggestion instead.
-                            </p>
-                            <button class="btn generate-new-field-btn" data-field-name="${result.field_name}" data-field-definition="${btoa(result.field_definition)}">
-                                💡 Generate New Field
-                            </button>
-                        </div>
-                    `;
-                }
-                
-                if (result.new_field_suggestion) {
-                    const suggestion = result.new_field_suggestion;
-                    html += `
-                        <h4>💡 New Field Suggestion:</h4>
-                        <div class="suggestion-container">
-                            <div class="suggestion-field">
-                                <strong>Suggested Name:</strong> <span class="field-value">${suggestion.attribute}</span>
-                            </div>
-                            <div class="suggestion-field">
-                                <strong>Category:</strong> <span class="field-value">${suggestion.category}</span> | 
-                                <strong>Type:</strong> <span class="field-value">${suggestion.data_type}</span>
-                            </div>
-                            <div class="suggestion-field">
-                                <strong>Label:</strong> <span class="field-value">${suggestion.label}</span>
-                            </div>
-                            <div class="suggestion-field">
-                                <strong>Description:</strong> <span class="field-value">${suggestion.description}</span>
-                            </div>
-                            <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
-                                <button class="btn btn-success" onclick="downloadSuggestion('csv', '${suggestion.attribute}', '${suggestion.category}', '${suggestion.data_type}', '${suggestion.label}', '${suggestion.description.replace(/'/g, "\\'")}')">
-                                    📄 Download CSV
-                                </button>
-                                <button class="btn btn-success" onclick="downloadSuggestion('json', '${suggestion.attribute}', '${suggestion.category}', '${suggestion.data_type}', '${suggestion.label}', '${suggestion.description.replace(/'/g, "\\'")}')">
-                                    📋 Download JSON
-                                </button>
-                                <button class="btn btn-secondary provide-feedback-btn" data-field-name="${result.field_name}" data-field-definition="${btoa(result.field_definition)}">
-                                    🔄 Provide Feedback & Regenerate
-                                </button>
-                            </div>
-                        </div>
-                    `;
-                }
-                
-                contentDiv.innerHTML = html;
-                resultsDiv.classList.remove('hidden');
-                
-                // Add event listeners for the new buttons
-                const generateNewBtn = contentDiv.querySelector('.generate-new-field-btn');
-                if (generateNewBtn) {
-                    generateNewBtn.addEventListener('click', function() {
-                        const fieldName = this.getAttribute('data-field-name');
-                        const fieldDefinition = atob(this.getAttribute('data-field-definition'));
-                        generateNewFieldFromMatches(fieldName, fieldDefinition);
-                    });
-                }
-                
-                const provideFeedbackBtn = contentDiv.querySelector('.provide-feedback-btn');
-                if (provideFeedbackBtn) {
-                    provideFeedbackBtn.addEventListener('click', function() {
-                        const fieldName = this.getAttribute('data-field-name');
-                        const fieldDefinition = atob(this.getAttribute('data-field-definition'));
-                        provideFeedback(fieldName, fieldDefinition);
-                    });
-                }
-            }
-            
-            async function downloadExampleFile(format) {
-                try {
-                    const response = await fetch(`/cdd-agent/web/example-file?format=${format}`, {
-                        headers: {
-                            'Authorization': `Bearer ${authToken}`
-                        }
-                    });
-                    
-                    if (response.ok) {
-                        const blob = await response.blob();
-                        const url = window.URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `example_cdd_mapping.${format}`;
-                        document.body.appendChild(a);
-                        a.click();
-                        window.URL.revokeObjectURL(url);
-                        document.body.removeChild(a);
-                    } else {
-                        const errorData = await response.json().catch(() => ({}));
-                        let errorMessage = 'Failed to download example file';
-                        
-                        if (response.status === 401 || response.status === 403) {
-                            errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                            document.getElementById('mainInterface').classList.add('hidden');
-                            authToken = null;
-                        } else if (errorData.detail) {
-                            errorMessage = errorData.detail;
-                        }
-                        
-                        showAlert('singleFieldStatus', errorMessage, 'error');
-                    }
-                } catch (error) {
-                    console.error('Download error:', error);
-                    showAlert('singleFieldStatus', 'Unable to download file. Please check your connection and try again.', 'error');
-                }
-            }
-            
-            // Utility functions
-            function showLoading(elementId, show) {
-                const element = document.getElementById(elementId);
-                if (show) {
-                    element.classList.remove('hidden');
-                } else {
-                    element.classList.add('hidden');
-                }
-            }
-            
-            function showAlert(elementId, message, type) {
-                const element = document.getElementById(elementId);
-                element.className = `alert alert-${type}`;
-                element.innerHTML = message;
-                element.classList.remove('hidden');
-            }
-            
-            function downloadSuggestion(format, attribute, category, dataType, label, description) {
-                try {
-                    // Create the suggestion data in the exact format of ZM_New_CDD_Field_Requests.csv
-                    const suggestionData = {
-                        Category: category,
-                        Attribute: attribute,
-                        Description: description,
-                        Label: label,
-                        Tag: "", // Leave empty as requested
-                        "New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW)": "New",
-                        "Partition Key Order (NOTE: LEAVE EMPTY FOR NOW)": "",
-                        "Index Key (NOTE: LEAVE EMPTY FOR NOW)": ""
-                    };
-                    
-                    let content, filename, mimeType;
-                    
-                    if (format === 'csv') {
-                        // Create CSV format matching ZM_New_CDD_Field_Requests.csv exactly
-                        const headers = [
-                            'Category',
-                            'Attribute', 
-                            'Description',
-                            'Label',
-                            'Tag',
-                            'New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW)',
-                            'Partition Key Order (NOTE: LEAVE EMPTY FOR NOW)',
-                            'Index Key (NOTE: LEAVE EMPTY FOR NOW)'
-                        ];
-                        const values = [
-                            suggestionData.Category,
-                            suggestionData.Attribute,
-                            `"${suggestionData.Description.replace(/"/g, '""')}"`, // Escape quotes in CSV
-                            suggestionData.Label,
-                            suggestionData.Tag,
-                            suggestionData["New - Update - Deprecate (NOTE: ALWAYS NEW FOR NOW)"],
-                            suggestionData["Partition Key Order (NOTE: LEAVE EMPTY FOR NOW)"],
-                            suggestionData["Index Key (NOTE: LEAVE EMPTY FOR NOW)"]
-                        ];
-                        content = headers.join(',') + '\\n' + values.join(',');
-                        filename = `ZM_New_CDD_Field_Request_${attribute}.csv`;
-                        mimeType = 'text/csv';
-                    } else {
-                        // Create JSON format
-                        content = JSON.stringify([suggestionData], null, 2);
-                        filename = `ZM_New_CDD_Field_Request_${attribute}.json`;
-                        mimeType = 'application/json';
-                    }
-                    
-                    // Create and trigger download
-                    const blob = new Blob([content], { type: mimeType });
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    document.body.removeChild(a);
-                    
-                    showAlert('singleFieldStatus', `${format.toUpperCase()} file downloaded successfully!`, 'success');
-                    
-                } catch (error) {
-                    console.error('Download error:', error);
-                    showAlert('singleFieldStatus', 'Failed to download suggestion file. Please try again.', 'error');
-                }
-            }
-            
-            // Global variable to track conversation history
-            let conversationHistory = [];
-            
-            // Theme utility functions
-            function isDarkMode() {
-                return document.body.classList.contains('dark-theme');
-            }
-            
-            function applyThemeToElement(element, lightStyles, darkStyles) {
-                if (isDarkMode()) {
-                    Object.assign(element.style, darkStyles);
-                } else {
-                    Object.assign(element.style, lightStyles);
-                }
-            }
-            
-            async function generateNewFieldFromMatches(fieldName, fieldDefinition) {
-                console.log('generateNewFieldFromMatches called with:', fieldName, fieldDefinition);
-                
-                // Clear any existing results and show loading
-                document.getElementById('singleFieldResults').classList.add('hidden');
-                showLoading('singleCheckLoadingIcon', true);
-                
-                try {
-                    const response = await fetch('/cdd-agent/web/check-field', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${authToken}`
-                        },
-                        body: JSON.stringify({
-                            field_name: fieldName,
-                            field_definition: fieldDefinition,
-                            force_new_suggestion: true // Flag to force new field generation
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        // Add to conversation history
-                        conversationHistory.push({
-                            action: 'generate_new_field',
-                            field_name: fieldName,
-                            field_definition: fieldDefinition,
-                            timestamp: new Date().toISOString()
-                        });
-                        
-                        displaySingleFieldResults(result);
-                    } else {
-                        let errorMessage = 'An error occurred while generating new field';
-                        if (response.status === 401 || response.status === 403) {
-                            errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                            document.getElementById('mainInterface').classList.add('hidden');
-                            authToken = null;
-                        } else if (result.detail) {
-                            errorMessage = result.detail;
-                        }
-                        showAlert('singleFieldStatus', errorMessage, 'error');
-                    }
-                } catch (error) {
-                    console.error('Generate new field error:', error);
-                    showAlert('singleFieldStatus', 'Unable to generate new field. Please check your connection and try again.', 'error');
-                }
-                
-                showLoading('singleCheckLoadingIcon', false);
-            }
-            
-            function provideFeedback(fieldName, fieldDefinition) {
-                // Create feedback modal with proper CSS classes
-                const modal = document.createElement('div');
-                modal.className = 'modal-overlay';
-                
-                modal.innerHTML = `
-                    <div class="modal-content">
-                        <h3 class="modal-header">💬 Provide Feedback</h3>
-                        <p class="modal-description">
-                            What would you like to change about the suggested field? Be specific about what you'd like to see different.
-                        </p>
-                        <textarea id="feedbackText" rows="4" class="modal-textarea" 
-                            placeholder="e.g., The category should be 'entityReference' instead of 'instrumentReference', or the description should be more specific about the calculation method..."></textarea>
-                        <div class="modal-footer">
-                            <button class="modal-btn modal-btn-cancel">
-                                Cancel
-                            </button>
-                            <button class="modal-btn modal-btn-submit" data-field-name="${fieldName}" data-field-definition="${btoa(fieldDefinition)}">
-                                Submit Feedback & Regenerate
-                            </button>
-                        </div>
-                    </div>
-                `;
-                
-                // Add event listeners for buttons
-                const submitBtn = modal.querySelector('.modal-btn-submit');
-                const cancelBtn = modal.querySelector('.modal-btn-cancel');
-                
-                submitBtn.addEventListener('click', function() {
-                    const fieldName = this.getAttribute('data-field-name');
-                    const fieldDefinition = atob(this.getAttribute('data-field-definition'));
-                    console.log('Submit button clicked:', fieldName, fieldDefinition); // Debug log
-                    submitFeedback(fieldName, fieldDefinition, modal);
-                });
-                
-                cancelBtn.addEventListener('click', function() {
-                    console.log('Cancel button clicked'); // Debug log
-                    document.removeEventListener('keydown', handleKeyDown);
-                    modal.remove();
-                });
-                
-                // Also allow clicking outside to close
-                modal.addEventListener('click', function(e) {
-                    if (e.target === modal) {
-                        console.log('Clicked outside modal'); // Debug log
-                        document.removeEventListener('keydown', handleKeyDown);
-                        modal.remove();
-                    }
-                });
-                
-                // Add keyboard support
-                const handleKeyDown = function(e) {
-                    if (e.key === 'Escape') {
-                        console.log('Escape key pressed'); // Debug log
-                        document.removeEventListener('keydown', handleKeyDown);
-                        modal.remove();
-                    }
-                };
-                modal.handleKeyDown = handleKeyDown; // Store reference for cleanup
-                document.addEventListener('keydown', handleKeyDown);
-                
-                document.body.appendChild(modal);
-                modal.querySelector('textarea').focus();
-            }
-            
-            async function submitFeedback(fieldName, fieldDefinition, modal) {
-                const feedbackText = modal.querySelector('#feedbackText').value.trim();
-                if (!feedbackText) {
-                    showAlert('singleFieldStatus', 'Please provide feedback before submitting.', 'error');
-                    return;
-                }
-                
-                console.log('Submitting feedback:', feedbackText); // Debug log
-                
-                // Add feedback to conversation history
-                conversationHistory.push({
-                    action: 'feedback',
-                    field_name: fieldName,
-                    field_definition: fieldDefinition,
-                    feedback: feedbackText,
-                    timestamp: new Date().toISOString()
-                });
-                
-                // Close modal and clean up event listeners
-                document.removeEventListener('keydown', modal.handleKeyDown);
-                modal.remove();
-                
-                // Show loading
-                document.getElementById('singleFieldResults').classList.add('hidden');
-                showLoading('singleCheckLoadingIcon', true);
-                
-                try {
-                    const response = await fetch('/cdd-agent/web/check-field', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${authToken}`
-                        },
-                        body: JSON.stringify({
-                            field_name: fieldName,
-                            field_definition: fieldDefinition,
-                            force_new_suggestion: true,
-                            feedback_history: conversationHistory
-                        })
-                    });
-                    
-                    const result = await response.json();
-                    
-                    if (response.ok) {
-                        displaySingleFieldResults(result);
-                        showAlert('singleFieldStatus', 'New suggestion generated based on your feedback!', 'success');
-                    } else {
-                        let errorMessage = 'An error occurred while processing feedback';
-                        if (response.status === 401 || response.status === 403) {
-                            errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                            document.getElementById('mainInterface').classList.add('hidden');
-                            authToken = null;
-                        } else if (result.detail) {
-                            errorMessage = result.detail;
-                        }
-                        showAlert('singleFieldStatus', errorMessage, 'error');
-                    }
-                } catch (error) {
-                    console.error('Feedback submission error:', error);
-                    showAlert('singleFieldStatus', 'Unable to process feedback. Please check your connection and try again.', 'error');
-                }
-                
-                showLoading('singleCheckLoadingIcon', false);
-            }
-        </script>
-    </body>
-    </html>
-    """
-    
-    return HTMLResponse(content=html_content) 
+    return FileResponse("app/static/html/main.html") 

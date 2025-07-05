@@ -22,7 +22,15 @@ class Settings(BaseSettings):
     NEW_CDD_FIELD_REQUEST_FILE: str = r"C:\Users\McNultyL\OneDrive - moodys.com\Documents\GitHub\ai-field-mapping\ZM_New_CDD_Field_Requests.csv"
     
     # Prompt debugging
-    SAVE_PROMPTS_TO_FILE: bool = False
+    SAVE_PROMPTS_TO_FILE: bool = True
+    
+    # Performance optimization
+    MAX_ATTRIBUTES_FOR_MATCHING: int = 50  # Reduce prompt size for better performance
+    
+    # Description compression settings
+    COMPRESSION_MODEL: str = "o4-mini"  # Small, fast model for compression
+    MAX_DESCRIPTION_TOKENS: int = 40        # Target compression size
+    COMPRESSION_BATCH_SIZE: int = 10        # Process N descriptions at once
     
     # Output formatting
     DEFAULT_LABEL_TAG: str = "ZM/OALM"

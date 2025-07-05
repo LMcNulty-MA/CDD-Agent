@@ -5,10 +5,13 @@ from app.core.models import (
     DatabasePopulationRequest,
     DatabasePopulationResponse,
     EnrichedCDDAttribute,
-    CDDCategory
+    CDDCategory,
+    DescriptionCompressionRequest,
+    DescriptionCompressionResponse
 )
 from app.core.documentdb import AsyncMongoDBClient
 from app.core.security import oauth2_scheme
+from app.core.services import cdd_mapping_service
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -142,7 +145,6 @@ async def get_attributes(auth_request: Request):
                 'tenant': attr.get('tenant'),
                 'enum_type': attr.get('enumType'),  # camelCase to snake_case
                 'category': attr.get('category'),
-                'category_description': attr.get('category_description'),
                 'is_internal': attr.get('is_internal'),
                 'input_partition_order': attr.get('input_partition_order'),
                 'output_partition_order': attr.get('output_partition_order'),
@@ -207,4 +209,64 @@ async def get_categories(auth_request: Request):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to retrieve CDD categories. The database service may be temporarily unavailable. Please try again later."
+        )
+
+@router.post(
+    "/compress-descriptions",
+    summary="Compress CDD Attribute Descriptions",
+    description="Use AI to compress all CDD attribute descriptions for better prompt performance",
+    response_model=DescriptionCompressionResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(oauth2_scheme)]
+)
+async def compress_descriptions(
+    request: DescriptionCompressionRequest,
+    auth_request: Request
+):
+    """Compress CDD attribute descriptions using AI to improve matching performance"""
+    try:
+        logger.info(f"Starting description compression: batch_size={request.batch_size}, dry_run={request.dry_run}")
+        
+        # Use the service to compress descriptions
+        result = cdd_mapping_service.compress_all_descriptions(
+            batch_size=request.batch_size,
+            dry_run=request.dry_run
+        )
+        
+        # Determine status
+        status_text = "success"
+        if result['failed_count'] > 0:
+            status_text = "partial" if result['compressed_count'] > 0 else "failed"
+        
+        # Create response message
+        if request.dry_run:
+            message = f"Dry run completed. Would compress {result['compressed_count']} descriptions"
+        else:
+            message = f"Compressed {result['compressed_count']} descriptions successfully"
+        
+        if result['failed_count'] > 0:
+            message += f", {result['failed_count']} failed"
+        if result['skipped_count'] > 0:
+            message += f", {result['skipped_count']} already short enough"
+        
+        logger.info(f"Compression completed: {message}")
+        
+        return DescriptionCompressionResponse(
+            status=status_text,
+            total_processed=result['total_processed'],
+            compressed_count=result['compressed_count'], 
+            failed_count=result['failed_count'],
+            skipped_count=result['skipped_count'],
+            message=message,
+            preview_samples=result.get('preview_samples')
+        )
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (like auth errors) as-is
+        raise
+    except Exception as e:
+        logger.error(f"Error compressing descriptions: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Unable to compress descriptions: {str(e)}. The service may be temporarily unavailable."
         ) 

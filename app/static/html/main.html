@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CDD Field Mapping Tool</title>
+    <link rel="stylesheet" href="/cdd-agent/web/static/css/styles.css">
+</head>
+<body>
+    <div class="theme-switch-container">
+        <span class="theme-switch-label">Dark Mode</span>
+        <label class="theme-switch">
+            <input type="checkbox" id="theme-toggle">
+            <span class="slider"></span>
+        </label>
+    </div>
+    
+    <div class="container">
+        <div class="header">
+            <h1>🎯 CDD Field Mapping Tool</h1>
+            <p>Intelligent mapping of your fields to Common Data Dictionary attributes</p>
+        </div>
+        
+        <!-- Authentication Section -->
+        <div class="card auth-section">
+            <h2>Authentication</h2>
+            <div class="form-group">
+                <label for="authToken">Authentication Token:</label>
+                <input type="password" id="authToken" placeholder="Enter your authentication token">
+            </div>
+            <div class="action-buttons">
+                <button class="btn" onclick="authenticateUser()">
+                    <span id="authLoadingIcon" class="loading hidden"></span>
+                    Authenticate
+                </button>
+                <div id="authStatus" class="inline-alert hidden"></div>
+            </div>
+        </div>
+        
+        <!-- Main Interface (hidden until authenticated) -->
+        <div id="mainInterface" class="hidden">
+            <!-- Example Files Section (moved to top) -->
+            <div class="card">
+                <h2>📋 Example Files</h2>
+                <p style="margin-bottom: 20px;">
+                    Download example files to see the required format for bulk processing.
+                </p>
+                <button class="btn btn-secondary" onclick="downloadExampleFile('csv')">
+                    📄 Download CSV Example
+                </button>
+                <button class="btn btn-secondary" onclick="downloadExampleFile('json')">
+                    📋 Download JSON Example
+                </button>
+            </div>
+            
+            <!-- File Upload and Processing Section -->
+            <div class="card">
+                <h2>📁 Bulk File Processing</h2>
+                <p style="margin-bottom: 20px;">
+                    Upload a CSV or JSON file to process multiple fields at once, just like the command line tool.
+                </p>
+                
+                <!-- File Upload -->
+                <div id="fileUploadSection">
+                    <div class="form-group">
+                        <label for="fileInput">Select File (CSV or JSON):</label>
+                        <input type="file" id="fileInput" accept=".csv,.json" onchange="handleFileSelect(event)">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="outputFormat">New Fields Output Format:</label>
+                        <select id="outputFormat">
+                            <option value="csv">CSV</option>
+                            <option value="json">JSON</option>
+                        </select>
+                    </div>
+                    
+                    <button class="btn" onclick="uploadFile()" id="uploadBtn" disabled>
+                        <span id="uploadLoadingIcon" class="loading hidden"></span>
+                        Upload & Start Processing
+                    </button>
+                    
+                    <div id="uploadStatus" class="hidden"></div>
+                </div>
+                
+                <!-- Processing Interface (hidden initially) -->
+                <div id="processingInterface" class="hidden">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar">
+                            <div id="progressFill" class="progress-fill"></div>
+                        </div>
+                        <div id="progressText" class="progress-text">0 / 0 fields processed</div>
+                    </div>
+                    
+                    <!-- Current Field Display -->
+                    <div id="currentFieldSection" class="current-field-section">
+                        <h3>Current Field</h3>
+                        <div id="currentFieldInfo" class="field-info">
+                            <!-- Field info will be populated here -->
+                        </div>
+                        
+                        <!-- Matches Display -->
+                        <div id="matchesSection" class="hidden">
+                            <h4>🎯 Potential Matches</h4>
+                            <div id="matchesList" class="matches-list">
+                                <!-- Matches will be populated here -->
+                            </div>
+                            
+                            <!-- Feedback Section for Matches -->
+                            <div class="feedback-section">
+                                <div class="form-group">
+                                    <label for="bulkMatchFeedback">💬 Feedback to improve matches (optional):</label>
+                                    <textarea id="bulkMatchFeedback" rows="2" placeholder="e.g., 'Focus on loan-related fields', 'Consider numeric fields only'..."></textarea>
+                                </div>
+                                <div class="action-buttons">
+                                    <button class="btn btn-warning" onclick="improveMatches()">
+                                        🔄 Improve Matches
+                                        <span class="loading-icon hidden" id="improveBulkMatchesIcon">⏳</span>
+                                    </button>
+                                    <button class="btn btn-success" onclick="createNewField()">
+                                        💡 Create New Field
+                                        <span class="loading-icon hidden" id="newFieldLoadingIcon">⏳</span>
+                                    </button>
+                                    <button class="btn btn-secondary" onclick="skipField()">
+                                        ⏭️ Skip Field
+                                    </button>
+                                    <div id="bulkMatchesInlineAlert" class="inline-alert hidden"></div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- New Field Creation -->
+                        <div id="newFieldSection" class="hidden">
+                            <h4>💡 New Field Suggestion</h4>
+                            <div id="newFieldDisplay" class="new-field-display">
+                                <!-- New field suggestion will be populated here -->
+                            </div>
+                            <div class="feedback-section">
+                                <div class="form-group">
+                                    <label for="bulkNewFieldFeedback">💬 Feedback to improve new field (optional):</label>
+                                    <textarea id="bulkNewFieldFeedback" rows="2" placeholder="e.g., 'Make it more specific', 'Add validation rules'..."></textarea>
+                                </div>
+                                <div class="action-buttons">
+                                    <button class="btn btn-primary" onclick="acceptNewField()">
+                                        ✅ Accept New Field
+                                    </button>
+                                    <button class="btn btn-warning" onclick="improveNewField()">
+                                        🔄 Improve New Field
+                                        <span class="loading-icon hidden" id="improveBulkNewFieldIcon">⏳</span>
+                                    </button>
+                                    <button class="btn btn-secondary" onclick="skipField()">
+                                        ⏭️ Skip Field
+                                    </button>
+                                    <div id="bulkNewFieldInlineAlert" class="inline-alert hidden"></div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Loading State -->
+                        <div id="loadingNextField" class="loading-section hidden">
+                            <div class="loading-spinner"></div>
+                            <p>Loading next field...</p>
+                        </div>
+                    </div>
+                    
+                    <!-- Session Controls -->
+                    <div class="session-controls">
+                        <button class="btn btn-success" onclick="downloadFiles('updated_input')" id="downloadInputBtn">
+                            📥 Download Updated Input File
+                        </button>
+                        <button class="btn btn-success" onclick="downloadFiles('new_fields')" id="downloadNewFieldsBtn">
+                            📥 Download New Fields
+                        </button>
+                        <button class="btn btn-danger" onclick="exitProcessing()">
+                            🚪 Exit Processing
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Single Field Check Section (moved below bulk processing) -->
+            <div class="card">
+                <h2>🔍 Single Field Check</h2>
+                <p style="margin-bottom: 20px;">
+                    Test a single field against the CDD database to see potential matches or get suggestions for new fields.
+                </p>
+                
+                <div class="form-group">
+                    <label for="fieldName">Field Name:</label>
+                    <input type="text" id="fieldName" placeholder="e.g., LoanAmount, InterestRate">
+                </div>
+                
+                <div class="form-group">
+                    <label for="fieldDefinition">Field Definition/Description:</label>
+                    <textarea id="fieldDefinition" rows="3" placeholder="Describe what this field represents..."></textarea>
+                </div>
+                
+                <div class="action-buttons">
+                    <button class="btn" onclick="checkSingleField()">
+                        <span id="singleCheckLoadingIcon" class="loading hidden"></span>
+                        🔍 Find Matches
+                    </button>
+                    <div id="singleFieldStatus" class="inline-alert hidden"></div>
+                </div>
+                
+                <!-- Results Section -->
+                <div id="singleFieldResults" class="hidden">
+                    <h3>Results:</h3>
+                    
+                    <!-- Matches Display -->
+                    <div id="singleFieldMatches" class="hidden">
+                        <h4>🎯 Potential Matches</h4>
+                        <div id="singleFieldMatchesList" class="matches-list">
+                            <!-- Matches will be populated here -->
+                        </div>
+                        
+                        <!-- Feedback Section for Matches -->
+                        <div class="feedback-section">
+                            <div class="form-group">
+                                <label for="matchFeedback">💬 Feedback to improve matches (optional):</label>
+                                <textarea id="matchFeedback" rows="2" placeholder="e.g., 'Focus on loan-related fields', 'Consider numeric fields only'..."></textarea>
+                            </div>
+                            <div class="action-buttons">
+                                <button class="btn btn-warning" onclick="improveSingleFieldMatches()">
+                                    <span id="improveSingleFieldMatchesIcon" class="loading hidden"></span>
+                                    🔄 Improve Matches
+                                </button>
+                                <button class="btn btn-success" onclick="createSingleFieldNewField()">
+                                    <span id="createSingleFieldNewFieldIcon" class="loading hidden"></span>
+                                    💡 Create New Field
+                                </button>
+                                <div id="singleFieldMatchesInlineAlert" class="inline-alert hidden"></div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- New Field Display -->
+                    <div id="singleFieldNewField" class="hidden">
+                        <h4>💡 New Field Suggestion</h4>
+                        <div id="singleFieldNewFieldDisplay" class="new-field-display">
+                            <!-- New field suggestion will be populated here -->
+                        </div>
+                        
+                        <!-- Feedback Section for New Field -->
+                        <div class="feedback-section">
+                            <div class="form-group">
+                                <label for="newFieldFeedback">💬 Feedback to improve new field (optional):</label>
+                                <textarea id="newFieldFeedback" rows="2" placeholder="e.g., 'Use a different category', 'Make the description more specific'..."></textarea>
+                            </div>
+                            <div class="action-buttons">
+                                <button class="btn btn-warning" onclick="improveSingleFieldNewField()">
+                                    <span id="improveSingleFieldNewFieldIcon" class="loading hidden"></span>
+                                    🔄 Improve New Field
+                                </button>
+                                <button class="btn btn-success" onclick="downloadSingleFieldNewField('csv')">
+                                    📥 Download CSV
+                                </button>
+                                <button class="btn btn-success" onclick="downloadSingleFieldNewField('json')">
+                                    📥 Download JSON
+                                </button>
+                                <div id="singleFieldNewFieldInlineAlert" class="inline-alert hidden"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/cdd-agent/web/static/js/main.js"></script>
+</body>
+</html> 

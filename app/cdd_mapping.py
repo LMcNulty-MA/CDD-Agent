@@ -24,6 +24,7 @@ from app.config import settings
 from app.core.documentdb import MongoDBClient  # Using sync client for CLI
 from app.core.models import StandardFieldHeaders
 from app.core.utils import save_prompt_and_response
+from app.core.prompts import get_prompt_builder, get_system_message
 
 # Configuration
 OPENAI_API_KEY = settings.OPENAI_API_KEY
@@ -297,45 +298,20 @@ def find_best_cdd_matches(field_name: str, field_definition: str, attributes: Li
     
     # Clean, concise prompt with all relevant context
     cdd_context = create_optimized_matching_context(attributes)
-    prompt = f"""
-You are an expert in financial data mapping and ALM (Asset Liability Management) systems.
-
-Field to Match:
-- Name: {field_name}
-- Definition: {field_definition}
-
-Available CDD Attributes:
-{cdd_context}
-
-Instructions:
-1. Find the top 3 best matches from the CDD attributes for this field.
-2. Consider semantic similarity between field names, display names (in quotes), and descriptions
-3. Pay attention to data types [in brackets] - ensure compatibility (e.g., dates should match dates, strings with strings)
-4. Consider the business context and category (in parentheses) - financial/ALM fields should match similar contexts
-5. Include confidence scores (0.0 to 1.0) based on:
-   - Name/display name similarity (30%)
-   - Definition/description semantic match (50%) 
-   - Data type compatibility (10%)
-   - Category/business context fit (10%)
-6. Only suggest matches that are highly likely to be semantically equivalent or very closely related
-7. Return results as a JSON array with fields: name, confidence_score, reasoning
-8. If you cannot find any highly confident matches (>0.5), return an empty array
-9. Prioritize exact or near-exact semantic matches over partial matches
-
-Focus on semantic meaning and financial/ALM relevance rather than exact string matching.
-
-Response format:
-[
-  {{"name": "cdd_field_name", "confidence_score": 0.95, "reasoning": "Brief explanation covering name, definition, data type, and context match"}},
-  ...
-]
-"""
+    
+    # Use centralized prompt builder
+    prompt_builder = get_prompt_builder()
+    prompt = prompt_builder.build_cli_field_matching_prompt(
+        field_name=field_name,
+        field_definition=field_definition,
+        context=cdd_context
+    )
     
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": "You are a financial data mapping expert specializing in ALM and banking systems. Provide only valid JSON response."},
+                {"role": "system", "content": get_system_message("financial_data_expert")},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=400,
@@ -433,55 +409,23 @@ def create_new_cdd_field_suggestion(field_name: str, field_definition: str, cate
     feedback_context = ""
     if feedback_history:
         feedback_context = f"\n\nPREVIOUS FEEDBACK AND REVISIONS:\n{feedback_history}\n\nPlease address the feedback in your new suggestion."
-    prompt = f"""
-You are an expert in financial data mapping and CDD (Common Data Dictionary) design.
-
-Field to Create:
-- Name: {field_name}
-- Definition: {field_definition}
-
-Available CDD Categories:
-{category_context}
-
-Example CDD Attributes (for format reference only):
-{example_context}
-
-CDD Guidelines:
-{cdd_guidelines}
-{feedback_context}
-
-Instructions:
-1. Create a new CDD field suggestion following the guidelines.
-2. Choose the most appropriate existing category from the list above based on the field's business purpose.
-3. Create a camelCase field name following naming conventions (descriptive, <64 chars, no acronyms unless standard).
-4. Suggest appropriate data type based on the field definition:
-   - STRING for text, names, descriptions, codes
-   - DECIMAL for rates, percentages, amounts, prices
-   - DATE for dates
-   - BOOLEAN for true/false flags
-   - INTEGER for counts, whole numbers
-5. Create a clear, professional description following the guidelines (avoid jargon, be specific).
-6. Create a user-friendly display label (proper capitalization, spaces, readable).
-
-Return ONLY a valid JSON object with these exact fields:
-{{
-  "Category": "categoryName",
-  "Attribute": "newFieldName",
-  "Description": "Professional description following guidelines",
-  "Label": "User-Friendly Display Name",
-  "Tag": "{tag}",
-  "New-Update-Deprecate": "New",
-  "Partition Key Order": "",
-  "Index Key": "",
-  "data_type": "STRING"
-}}
-"""
+    
+    # Use centralized prompt builder
+    prompt_builder = get_prompt_builder()
+    prompt = prompt_builder.build_cli_new_field_creation_prompt(
+        field_name=field_name,
+        field_definition=field_definition,
+        category_context=category_context,
+        example_context=example_context,
+        tag=tag,
+        feedback_context=feedback_context
+    )
     
     try:
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": "You are a CDD design expert. Return ONLY a valid JSON object with no markdown formatting or extra text."},
+                {"role": "system", "content": get_system_message("cdd_design_expert")},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=500,
@@ -498,7 +442,7 @@ Return ONLY a valid JSON object with these exact fields:
         # Use dynamic JSON parsing
         suggestion = parse_json_response(result)
         if suggestion:
-            return suggestion
+        return suggestion
         else:
             print(f"{RED}Could not parse JSON from response{RESET}")
             print(f"{WHITE}Raw response: {result}{RESET}")
@@ -623,10 +567,10 @@ def update_input_file_with_mapping(df: pd.DataFrame, row_index, cdd_field_name: 
 def save_updated_input_file(df: pd.DataFrame, original_file_path: str):
     """Save the updated input file with CDD mappings"""
     try:
-        if original_file_path.lower().endswith('.json'):
-            df.to_json(original_file_path, orient='records', indent=2)
-        else:
-            df.to_csv(original_file_path, index=False)
+    if original_file_path.lower().endswith('.json'):
+        df.to_json(original_file_path, orient='records', indent=2)
+    else:
+        df.to_csv(original_file_path, index=False)
         print(f"{GREEN}✓ Updated input file saved: {original_file_path}{RESET}")
     except Exception as e:
         print(f"{RED}✗ Error saving updated input file: {e}{RESET}")
@@ -676,12 +620,12 @@ def save_single_new_field_request(suggestion: Dict, output_file_path: str):
     
     # Save to file
     try:
-        if output_file_path.lower().endswith('.json'):
-            combined_df.to_json(output_file_path, orient='records', indent=2)
-        else:
-            combined_df.to_csv(output_file_path, index=False)
+    if output_file_path.lower().endswith('.json'):
+        combined_df.to_json(output_file_path, orient='records', indent=2)
+    else:
+        combined_df.to_csv(output_file_path, index=False)
         print(f"{GREEN}✓ New field request saved to: {output_file_path}{RESET}")
-        print(f"{WHITE}Total records in output file: {len(combined_df)}{RESET}")
+    print(f"{WHITE}Total records in output file: {len(combined_df)}{RESET}")
     except Exception as e:
         print(f"{RED}✗ Error saving new field request: {e}{RESET}")
 
@@ -788,15 +732,15 @@ def main():
             if not is_sufficient:
                 print(f"{YELLOW}Skipping field due to insufficient context - marked as SKIP{RESET}")
                 update_input_file_with_mapping(df, index, "SKIP", INPUT_FILE_PATH)
-            else:
-                print(f"{YELLOW}No confident matches found. Creating new field suggestion...{RESET}")
-                suggestion = interactive_new_field_creation(field_name, field_definition, cdd_categories, cdd_attributes, cdd_guidelines)
-                if suggestion:
+        else:
+            print(f"{YELLOW}No confident matches found. Creating new field suggestion...{RESET}")
+            suggestion = interactive_new_field_creation(field_name, field_definition, cdd_categories, cdd_attributes, cdd_guidelines)
+            if suggestion:
                     # Save immediately instead of adding to list
                     save_single_new_field_request(suggestion, OUTPUT_FILE_PATH)
                     update_input_file_with_mapping(df, index, "NEW_FIELD_REQUESTED", INPUT_FILE_PATH)
-                    print(f"{GREEN}New field request added{RESET}")
-                else:
+                print(f"{GREEN}New field request added{RESET}")
+            else:
                     update_input_file_with_mapping(df, index, "SKIP", INPUT_FILE_PATH)
     
     # Save results

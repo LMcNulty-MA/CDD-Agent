@@ -75,4 +75,126 @@ def save_prompt_and_response(prompt: str, output_file: str, response: Optional[s
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(content)
 
+
+class ProcessLogger:
+    """
+    Reusable logging utility for specific processes with dedicated log files.
+    
+    Features:
+    - Creates logs directory automatically
+    - Clears log file on first use
+    - Supports different log levels (INFO, ERROR, DEBUG)
+    - Thread-safe writing
+    - Context manager support
+    
+    Usage:
+        logger = ProcessLogger("compression_process.log")
+        logger.info("Process started")
+        logger.error("Something failed", context={"field": "someField", "error": str(e)})
+        
+        # Or as context manager:
+        with ProcessLogger("import_process.log") as logger:
+            logger.info("Starting import...")
+    """
+    
+    def __init__(self, filename: str, auto_clear: bool = True):
+        """
+        Initialize process logger
+        
+        Args:
+            filename: Name of log file (e.g., "compression.log")
+            auto_clear: Whether to clear the file on first write (default: True)
+        """
+        self.filename = filename
+        self.auto_clear = auto_clear
+        self._first_write = True
+        self._setup_log_file()
+    
+    def _setup_log_file(self):
+        """Set up the log file path and create logs directory"""
+        # Create logs directory in project root
+        self.logs_dir = os.path.join(os.path.dirname(__file__), "..", "..", "logs")
+        os.makedirs(self.logs_dir, exist_ok=True)
+        
+        # Full path to log file
+        self.log_file_path = os.path.join(self.logs_dir, self.filename)
+    
+    def _write_log(self, level: str, message: str, context: Optional[Dict[str, Any]] = None):
+        """Internal method to write log entries"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Clear file on first write if auto_clear is enabled
+        if self._first_write and self.auto_clear:
+            mode = 'w'
+            self._first_write = False
+        else:
+            mode = 'a'
+        
+        # Format log entry
+        log_entry = f"[{timestamp}] {level}: {message}"
+        
+        # Add context if provided
+        if context:
+            context_str = ", ".join([f"{k}={v}" for k, v in context.items()])
+            log_entry += f" | Context: {context_str}"
+        
+        log_entry += "\n"
+        
+        try:
+            with open(self.log_file_path, mode, encoding='utf-8') as f:
+                f.write(log_entry)
+        except Exception as e:
+            print(f"❌ Failed to write to log file {self.filename}: {e}")
+    
+    def info(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log an info message"""
+        self._write_log("INFO", message, context)
+    
+    def error(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log an error message"""
+        self._write_log("ERROR", message, context)
+    
+    def debug(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log a debug message"""
+        self._write_log("DEBUG", message, context)
+    
+    def warning(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log a warning message"""
+        self._write_log("WARNING", message, context)
+    
+    def section(self, title: str):
+        """Log a section header for better organization"""
+        separator = "=" * 50
+        self._write_log("SECTION", f"\n{separator}\n{title}\n{separator}")
+    
+    def success(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log a success message"""
+        self._write_log("SUCCESS", f"✅ {message}", context)
+    
+    def failure(self, message: str, context: Optional[Dict[str, Any]] = None):
+        """Log a failure message"""
+        self._write_log("FAILURE", f"❌ {message}", context)
+    
+    def get_log_path(self) -> str:
+        """Get the full path to the log file"""
+        return self.log_file_path
+    
+    def clear_log(self):
+        """Manually clear the log file"""
+        try:
+            with open(self.log_file_path, 'w', encoding='utf-8') as f:
+                f.write("")
+            self._first_write = True
+        except Exception as e:
+            print(f"❌ Failed to clear log file {self.filename}: {e}")
+    
+    # Context manager support
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self.error(f"Process terminated with exception: {exc_val}", 
+                      context={"exception_type": exc_type.__name__})
+
  

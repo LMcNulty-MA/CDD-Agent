@@ -26,7 +26,7 @@ AI-powered agent for help find matching CDD fields or add new fields
     - Navigate to the root of the directory in command prompt and run
         - python -m scripts.start_server
 
-    - Open the API documentation: http://localhost:5000/cdd-agent/docs#/
+    - Open the API documentation: http://localhost:5000/cdd-agent/web
 
 8. For questions or concerns during setup, please reach out to logan.mcnulty@moodys.com.
 
@@ -36,7 +36,7 @@ AI-powered agent for help find matching CDD fields or add new fields
 3. docker build -t cdd-agent .
 4. docker run --env-file .env -d --name cdd-agent-container -p 5000:5000 cdd-agent
 5. Open docker desktop app and see that the image is running in the 'Containers' tab
-6. Navigate to http://localhost:5000/cdd-agent/docs#/
+6. Navigate to http://localhost:5000/cdd-agent/web
 
 
 ## In order to Authenticate for use via CI 

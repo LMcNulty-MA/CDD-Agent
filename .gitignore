@@ -1,3 +1,8 @@
 .env
 *.pyc
 /prompts_out
+ZM Engine Fields.csv
+ZM Engine Fields_EXAMPLE.json
+ZM_New_CDD_Field_Requests.csv
+ZM_New_CDD_Field_Requests_EXAMPLE.json
+test.py

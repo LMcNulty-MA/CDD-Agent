@@ -9,6 +9,8 @@ import pandas as pd
 import json
 import os
 import re
+import logging
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 
 try:
@@ -21,8 +23,10 @@ from app.config import settings
 from app.core.documentdb import MongoDBClient
 from app.core.models import (
     StandardFieldHeaders, CDDMatchResult, NewCDDFieldSuggestion,
-    SingleFieldCheckResponse
+    SingleFieldCheckResponse, DescriptionCompressionResponse
 )
+from app.core.utils import save_prompt_and_response, ProcessLogger
+from app.core.prompts import get_prompt_builder, get_system_message
 
 # Set up OpenAI client if available
 if HAS_OPENAI:
@@ -68,8 +72,8 @@ class CDDMappingService:
             print(f"Error fetching CDD data: {e}")
             return [], []
 
-    def find_best_cdd_matches(self, field_name: str, field_definition: str, cdd_attributes: List[Dict], max_matches: int = 5) -> List[Dict]:
-        """Find best CDD matches for a field using GPT-4"""
+    def find_best_cdd_matches(self, field_name: str, field_definition: str, cdd_attributes: List[Dict], max_matches: int = 5, feedback_text: Optional[str] = None) -> List[Dict]:
+        """Find best CDD matches for a field using GPT-4 with optional feedback"""
         if not HAS_OPENAI or not client:
             print("OpenAI not available, returning empty matches")
             return []
@@ -88,51 +92,44 @@ class CDDMappingService:
         # Create context for matching
         context = self._create_optimized_matching_context(cdd_attributes)
         
-        prompt = f"""
-        You are an expert in financial data mapping and CDD (Common Data Dictionary) field matching.
-        
-        Field to Match:
-        - Name: {field_name}
-        - Definition: {field_definition}
-        
-        {context}
-        
-        INSTRUCTIONS:
-        1. Find the best matching CDD attributes for the given field
-        2. Consider semantic similarity between field names, display names, and descriptions
-        3. Pay attention to data types - ensure compatibility (e.g., dates should match dates, strings with strings)
-        4. Consider the business context and category - financial/ALM fields should match similar contexts
-        5. Return up to {max_matches} best matches
-        6. Include confidence scores (0.0 to 1.0) based on:
-           - Name/display name similarity (30%)
-           - Definition/description semantic match (50%) 
-           - Data type compatibility (10%)
-           - Category/business context fit (10%)
-        7. Only include matches with confidence > 0.3
-        8. Prioritize exact or near-exact semantic matches over partial matches
-        
-        Return JSON array of matches:
-        [
-            {{
-                "cdd_field": "attributeName",
-                "confidence_score": 0.85,
-                "reasoning": "Brief explanation covering name, definition, data type, and context match"
-            }}
-        ]
-        """
+        # Use centralized prompt builder with feedback
+        prompt_builder = get_prompt_builder()
+        prompt = prompt_builder.build_field_matching_prompt(
+            field_name=field_name,
+            field_definition=field_definition,
+            context=context,
+            max_matches=max_matches,
+            use_alm_format=False,
+            feedback_text=feedback_text
+        )
         
         try:
-            response = client.chat.completions.create(
-                model=settings.MODEL_TO_USE,
-                messages=[
-                    {"role": "system", "content": "You are a CDD field matching expert. Return ONLY valid JSON array."},
+            # Prepare API call parameters
+            api_params = {
+                "model": settings.MODEL_TO_USE,
+                "messages": [
+                    {"role": "system", "content": get_system_message("field_matching_expert")},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=1000,
-                temperature=0.1
-            )
+                "max_tokens": 1000,
+            }
+            
+            # Only add temperature for models that support it
+            if settings.MODEL_TO_USE not in ["gpt-4o-mini", "o1-mini", "o1-preview"]:
+                api_params["temperature"] = 0.1
+            
+            response = client.chat.completions.create(**api_params)
             
             result = response.choices[0].message.content.strip()
+            
+            # Save prompt and response for debugging (like CLI tool) - only if enabled
+            if settings.SAVE_PROMPTS_TO_FILE:
+                suffix = "_with_feedback" if feedback_text else ""
+                output_file = os.path.join(os.path.dirname(__file__), "..", "..", "prompts_out", f"web_matching_prompt{suffix}.txt")
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                save_prompt_and_response(prompt, output_file, result)
+                print(f"💾 Saved matching prompt to: {output_file}")
+            
             matches_data = self._parse_json_response(result)
             
             if not matches_data:
@@ -160,8 +157,8 @@ class CDDMappingService:
             print(f"Error finding matches: {e}")
             return []
 
-    def create_new_cdd_field_suggestion(self, field_name: str, field_definition: str, categories: List[Dict], attributes: List[Dict], tag: Optional[str] = None, feedback_history: str = "") -> Optional[Dict]:
-        """Create a new CDD field suggestion using GPT-4"""
+    def create_new_cdd_field_suggestion(self, field_name: str, field_definition: str, categories: List[Dict], attributes: List[Dict], tag: Optional[str] = None, feedback_text: Optional[str] = None) -> Optional[Dict]:
+        """Create a new CDD field suggestion using GPT-4 with optional feedback"""
         if not HAS_OPENAI or not client:
             print("OpenAI not available, returning no suggestion")
             return None
@@ -174,56 +171,22 @@ class CDDMappingService:
         
         category_context = self._create_rich_category_context(categories)
         
-        # Add feedback context if provided
-        feedback_context = ""
-        if feedback_history:
-            feedback_context = f"\n\nPREVIOUS FEEDBACK AND REVISIONS:\n{feedback_history}\n\nPlease address the feedback in your new suggestion."
-        
-        prompt = f"""
-        You are an expert in financial data mapping and CDD (Common Data Dictionary) design.
-
-        Field to Create:
-        - Name: {field_name}
-        - Definition: {field_definition}
-
-        Available CDD Categories:
-        {category_context}
-
-        CDD Guidelines:
-        {self.cdd_guidelines}{feedback_context}
-
-        Instructions:
-        1. Create a new CDD field suggestion following the guidelines.
-        2. Choose the most appropriate existing category from the list above based on the field's business purpose.
-        3. Create a camelCase field name following naming conventions (descriptive, <64 chars, no acronyms unless standard).
-        4. Suggest appropriate data type based on the field definition:
-           - STRING for text, names, descriptions, codes
-           - DECIMAL for rates, percentages, amounts, prices
-           - DATE for dates
-           - BOOLEAN for true/false flags
-           - INTEGER for counts, whole numbers
-        5. Create a clear, professional description following the guidelines (avoid jargon, be specific).
-        6. Create a user-friendly display label (proper capitalization, spaces, readable).
-
-        Return ONLY a valid JSON object with these exact fields:
-        {{
-          "Category": "categoryName",
-          "Attribute": "newFieldName",
-          "Description": "Professional description following guidelines",
-          "Label": "User-Friendly Display Name",
-          "Tag": "{tag}",
-          "New-Update-Deprecate": "New",
-          "Partition Key Order": "",
-          "Index Key": "",
-          "data_type": "STRING"
-        }}
-        """
+        # Use centralized prompt builder with feedback
+        prompt_builder = get_prompt_builder()
+        prompt = prompt_builder.build_new_field_creation_prompt(
+            field_name=field_name,
+            field_definition=field_definition,
+            category_context=category_context,
+            tag=tag,
+            feedback_text=feedback_text,
+            use_alm_format=False
+        )
         
         try:
             response = client.chat.completions.create(
                 model=settings.MODEL_TO_USE,
                 messages=[
-                    {"role": "system", "content": "You are a CDD design expert. Return ONLY a valid JSON object with no markdown formatting or extra text."},
+                    {"role": "system", "content": get_system_message("cdd_design_expert")},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=500,
@@ -231,6 +194,15 @@ class CDDMappingService:
             )
             
             result = response.choices[0].message.content.strip()
+            
+            # Save prompt and response for debugging (like CLI tool) - only if enabled
+            if settings.SAVE_PROMPTS_TO_FILE:
+                suffix = "_with_feedback" if feedback_text else ""
+                output_file = os.path.join(os.path.dirname(__file__), "..", "..", "prompts_out", f"web_field_suggestion_prompt{suffix}.txt")
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                save_prompt_and_response(prompt, output_file, result)
+                print(f"💾 Saved field suggestion prompt to: {output_file}")
+            
             return self._parse_json_response(result)
             
         except Exception as e:
@@ -283,47 +255,71 @@ class CDDMappingService:
         return True, cleaned_def
 
     def _create_optimized_matching_context(self, attributes: List[Dict]) -> str:
-        """Create optimized context for field matching with display names and data types"""
+        """Create optimized context for field matching with abbreviated format"""
+        # Category abbreviations to save tokens
+        category_abbrevs = {
+            'instrumentReference': 'InstRef',
+            'entityReference': 'EntRef', 
+            'interestRateInput': 'IRInput',
+            'accountCashFlow': 'AcctCF',
+            'loanPerformance': 'LoanPerf',
+            'collateralReference': 'CollRef',
+            'regulatoryReference': 'RegRef',
+            'marketDataInput': 'MktData',
+            'creditRiskInput': 'CreditRisk',
+            'operationalRiskInput': 'OpRisk'
+        }
+        
+        # Data type abbreviations
+        datatype_abbrevs = {
+            'String': 'S',
+            'Decimal': 'D', 
+            'Date': 'Dt',
+            'Boolean': 'B',
+            'Integer': 'I'
+        }
+        
         context_parts = ["AVAILABLE CDD ATTRIBUTES:"]
         for attr in attributes:
             name = attr.get('name', '')
-            display_name = attr.get('displayName', '')  # Database uses camelCase
             data_type = attr.get('dataType', '')  # Database uses camelCase
             category = attr.get('category', '')
             description = attr.get('description', '')
             
-            # Start with technical name
+            # Start with technical name (no display name to save tokens)
             context_line = f"• {name}"
             
-            # Add display name if different from technical name
-            if display_name and display_name != name:
-                context_line += f" \"{display_name}\""
-            
-            # Add data type in brackets
+            # Add abbreviated data type in brackets
             if data_type:
-                context_line += f" [{data_type}]"
+                abbrev_type = datatype_abbrevs.get(data_type, data_type)
+                context_line += f" [{abbrev_type}]"
             
-            # Add category in parentheses
+            # Add abbreviated category in parentheses
             if category:
-                context_line += f" ({category})"
+                abbrev_category = category_abbrevs.get(category, category)
+                context_line += f" ({abbrev_category})"
             
-            # Add description with colon
-            if description:
+            # Add description - use compressed version if available, fallback to full description
+            compressed_description = attr.get('description_compressed', '')
+            if compressed_description:
+                context_line += f": {compressed_description}"
+            elif description:
                 context_line += f": {description}"
+                # Log warning about fallback to full description
             
             context_parts.append(context_line)
         return "\n".join(context_parts)
 
     def _create_rich_category_context(self, categories: List[Dict]) -> str:
         """Create detailed category context for new field suggestions"""
-        context_parts = ["AVAILABLE CDD CATEGORIES:"]
+        context_parts = []
         
         for cat in categories:
             name = cat.get('name', '')
             display_name = cat.get('displayName', '')  # Database uses camelCase
             description = cat.get('description', '')
             
-            context_line = f"\n• {name}"
+            context_line = f"• {name}"
             if display_name and display_name != name:
                 context_line += f" ({display_name})"
             if description:
@@ -363,29 +359,28 @@ class CDDMappingService:
         
         return None
 
-    def check_single_field(self, field_name: str, field_definition: str, force_new_suggestion: bool = False, feedback_history: Optional[List[Dict]] = None) -> SingleFieldCheckResponse:
-        """Check a single field against CDD attributes with optional feedback handling"""
+    def check_single_field(self, field_name: str, field_definition: str, action_type: str = "find_matches", feedback_text: Optional[str] = None) -> SingleFieldCheckResponse:
+        """Check a single field against CDD attributes with feedback support"""
         # Get CDD data
         cdd_attributes, cdd_categories = self.get_all_cdd_data_from_db()
         
         # Clean the definition
         cleaned_definition = self._clean_field_definition(field_definition)
         
-        # Convert feedback history to string format for the AI prompt
-        feedback_text = ""
-        if feedback_history:
-            feedback_parts = []
-            for item in feedback_history:
-                if item.get('action') == 'feedback':
-                    feedback_parts.append(f"User feedback: {item.get('feedback', '')}")
-                elif item.get('action') == 'generate_new_field':
-                    feedback_parts.append(f"User requested new field generation for: {item.get('field_name', '')}")
-            feedback_text = "\n".join(feedback_parts)
-        
-        # Find matches (unless forced to create new suggestion)
+        # Handle different action types
         match_results = []
-        if not force_new_suggestion:
-            matches = self.find_best_cdd_matches(field_name, cleaned_definition, cdd_attributes)
+        new_field_suggestion = None
+        status = "no_match"
+        feedback_applied = bool(feedback_text)
+        
+        if action_type in ["find_matches", "improve_matches"]:
+            # Find matches with optional feedback
+            matches = self.find_best_cdd_matches(
+                field_name, 
+                cleaned_definition, 
+                cdd_attributes, 
+                feedback_text=feedback_text
+            )
             
             # Convert to response format
             for match in matches:
@@ -398,18 +393,20 @@ class CDDMappingService:
                     confidence_score=match['confidence_score']
                 )
                 match_results.append(match_result)
-        
-        # Determine status and create new field suggestion if needed
-        status = "no_match"
-        new_field_suggestion = None
-        
-        if match_results and match_results[0].confidence_score >= 0.6 and not force_new_suggestion:
-            status = "matched"
-        else:
-            # Create new field suggestion (with feedback if provided)
+            
+            if match_results and match_results[0].confidence_score >= 0.6:
+                status = "matched"
+            
+        elif action_type in ["create_new_field", "improve_new_field"]:
+            # Create new field suggestion with optional feedback
             suggestion_data = self.create_new_cdd_field_suggestion(
-                field_name, cleaned_definition, cdd_categories, cdd_attributes, feedback_history=feedback_text
+                field_name, 
+                cleaned_definition, 
+                cdd_categories, 
+                cdd_attributes, 
+                feedback_text=feedback_text
             )
+            
             if suggestion_data:
                 new_field_suggestion = NewCDDFieldSuggestion(
                     category=suggestion_data.get("Category", ""),
@@ -430,8 +427,283 @@ class CDDMappingService:
             matches=match_results,
             new_field_suggestion=new_field_suggestion,
             status=status,
-            confidence_threshold=0.6
+            confidence_threshold=0.6,
+            feedback_applied=feedback_applied
         )
+
+    def compress_attribute_description(self, description: str, field_name: str = "", data_type: str = "", display_name: str = "", max_tokens: Optional[int] = None) -> str:
+        """Compress a single attribute description using AI while preserving key information"""
+        if not HAS_OPENAI or not client:
+            print("OpenAI not available, returning original description")
+            return description
+        
+        word_count = len(description.split())
+        
+        # Skip very short descriptions - they're already concise enough
+        if word_count <= 5:
+            return description
+        
+        # Use centralized prompt builder with field context for better compression
+        prompt_builder = get_prompt_builder()
+        compression_prompt = prompt_builder.build_description_compression_prompt(
+            description=description,
+            field_name=field_name,
+            data_type=data_type,
+            display_name=display_name
+        )
+
+        try:
+            # Log the request details
+            request_logger = ProcessLogger("compression_api_requests.log", auto_clear=False)
+            request_logger.info("Sending compression request", context={
+                "model": settings.COMPRESSION_MODEL,
+                "field_name": field_name or "Unknown",
+                "data_type": data_type or "Unknown", 
+                "display_name": display_name or "Unknown",
+                "input_word_count": word_count,
+                "input_preview": description[:150] + "..."
+            })
+            
+            response = client.chat.completions.create(
+                model=settings.COMPRESSION_MODEL,
+                messages=[
+                    {"role": "system", "content": get_system_message("description_compression_expert")},
+                    {"role": "user", "content": compression_prompt}
+                ]
+            )
+            
+            # Log the raw response
+            raw_content = response.choices[0].message.content
+            request_logger.info("Received API response", context={
+                "raw_response": raw_content,
+                "response_type": type(raw_content).__name__,
+                "is_none": raw_content is None,
+                "is_empty": raw_content == "" if raw_content else "N/A",
+                "length": len(raw_content) if raw_content else 0
+            })
+            
+            compressed = raw_content.strip() if raw_content else ""
+            
+            # Log the processing result
+            request_logger.info("Processing response", context={
+                "after_strip": compressed,
+                "after_strip_length": len(compressed),
+                "is_shorter": len(compressed.split()) < len(description.split()) if compressed else False
+            })
+            
+            # Basic validation - make sure it's actually shorter
+            if compressed and len(compressed.split()) < len(description.split()):
+                request_logger.success("Compression successful", context={
+                    "original_words": len(description.split()),
+                    "compressed_words": len(compressed.split()),
+                    "result": compressed[:100] + "..."
+                })
+                return compressed
+            else:
+                request_logger.warning("Compression not shorter, returning original", context={
+                    "original_words": len(description.split()),
+                    "compressed_words": len(compressed.split()) if compressed else 0,
+                    "compressed_result": compressed[:100] + "..." if compressed else "EMPTY"
+                })
+                return description
+                
+        except Exception as e:
+            # Log detailed error information
+            error_msg = f"Error compressing description: {str(e)}"
+            print(error_msg)  # Keep console output for immediate feedback
+            
+            # Log detailed error to dedicated file
+            try:
+                error_logger = ProcessLogger("compression_api_errors.log", auto_clear=False)
+                error_logger.error("API compression failed", context={
+                    "error": str(e),
+                    "exception_type": type(e).__name__,
+                    "original_word_count": word_count,
+                    "model": settings.COMPRESSION_MODEL,
+                    "description_length_chars": len(description),
+                    "description_preview": description[:150] + "..." if len(description) > 150 else description
+                })
+            except:
+                pass  # Don't fail if logging fails
+            
+            return description
+
+    def compress_all_descriptions(self, batch_size: Optional[int] = None, dry_run: bool = False) -> Dict[str, Any]:
+        """Compress all attribute descriptions in the database"""
+        if batch_size is None:
+            batch_size = settings.COMPRESSION_BATCH_SIZE
+        
+        # Set up compression logging using ProcessLogger
+        logger = ProcessLogger("compression_process.log")
+        logger.section("COMPRESSION PROCESS STARTED")
+        logger.info("Process configuration", context={
+            "batch_size": batch_size, 
+            "dry_run": dry_run, 
+            "model": settings.COMPRESSION_MODEL
+        })
+        
+        try:
+            # Get total count for reporting
+            all_attributes, _ = self.get_all_cdd_data_from_db()
+            total_attributes_count = len(all_attributes)
+            
+            # Query MongoDB directly for attributes that need compression:
+            # - Has a description (exists and not empty)
+            # - Does NOT have a compressed description (field doesn't exist, is null, or is empty)
+            query_filter = {
+                "description": {"$exists": True, "$ne": "", "$ne": None},
+                "$or": [
+                    {"description_compressed": {"$exists": False}},
+                    {"description_compressed": None},
+                    {"description_compressed": ""},
+                    {"description_compressed": {"$regex": "^\\s*$"}}  # Empty or only whitespace
+                ]
+            }
+            
+            attributes_to_process = self.db_client.get_documents("attributes", query_filter, limit=0)
+            
+            logger.info("MongoDB query for attributes needing compression", context={
+                "total_attributes_in_db": total_attributes_count,
+                "attributes_needing_compression": len(attributes_to_process),
+                "skipped_count": total_attributes_count - len(attributes_to_process)
+            })
+            
+            stats = {
+                'total_processed': 0,
+                'compressed_count': 0,
+                'failed_count': 0,
+                'skipped_count': total_attributes_count - len(attributes_to_process)
+            }
+            
+            preview_samples = []
+            
+            # Process in batches
+            for i in range(0, len(attributes_to_process), batch_size):
+                batch = attributes_to_process[i:i + batch_size]
+                batch_num = i//batch_size + 1
+                total_batches = (len(attributes_to_process) + batch_size - 1)//batch_size
+                
+                print(f"Processing batch {batch_num}/{total_batches}...")
+                logger.info("Processing batch", context={
+                    "batch_num": batch_num, 
+                    "total_batches": total_batches, 
+                    "batch_size": len(batch)
+                })
+                
+                for attr in batch:
+                    attr_name = attr.get('name', 'UNKNOWN')
+                    original_desc = attr.get('description', '')
+                    attr_data_type = attr.get('dataType', '')  # Database uses camelCase
+                    attr_display_name = attr.get('displayName', '')  # Database uses camelCase
+                    
+                    # All filtering already done - these attributes need processing
+                    original_word_count = len(original_desc.split())
+                    
+                    # Compress description with field context
+                    logger.info("Compressing attribute", context={
+                        "attribute": attr_name, 
+                        "original_words": original_word_count,
+                        "original_preview": original_desc[:100] + "...",
+                        "data_type": attr_data_type,
+                        "display_name": attr_display_name
+                    })
+                    
+                    compressed_desc = self.compress_attribute_description(
+                        description=original_desc,
+                        field_name=attr_name,
+                        data_type=attr_data_type,
+                        display_name=attr_display_name
+                    )
+                    stats['total_processed'] += 1
+                    
+                    # VALIDATE the compressed description - must be shorter and meaningful
+                    is_valid_compression = (
+                        compressed_desc and  # Not empty
+                        compressed_desc.strip() and  # Not just whitespace
+                        compressed_desc != original_desc and  # Actually changed
+                        len(compressed_desc.split()) < original_word_count  # Actually shorter
+                    )
+                    
+                    if is_valid_compression:
+                        compressed_word_count = len(compressed_desc.split())
+                        stats['compressed_count'] += 1
+                        
+                        logger.success("Successfully compressed attribute", context={
+                            "attribute": attr_name,
+                            "original_words": original_word_count,
+                            "compressed_words": compressed_word_count,
+                            "reduction": f"{((original_word_count - compressed_word_count) / original_word_count * 100):.1f}%",
+                            "compressed_preview": compressed_desc[:100] + "..."
+                        })
+                        
+                        # Store sample for preview
+                        if len(preview_samples) < 5:
+                            preview_samples.append({
+                                'attribute': attr_name,
+                                'original': original_desc[:100] + '...' if len(original_desc) > 100 else original_desc,
+                                'compressed': compressed_desc
+                            })
+                        
+                        # Update database if not dry run - ADD NEW FIELD, DON'T OVERWRITE
+                        if not dry_run:
+                            try:
+                                logger.info("Saving compressed description to NEW field", context={
+                                    "attribute": attr_name,
+                                    "action": "adding_compressed_description_field"
+                                })
+                                self.db_client.update_document(
+                                    "attributes", 
+                                    {"name": attr_name}, 
+                                    {"$set": {"description_compressed": compressed_desc}}  # NEW FIELD!
+                                )
+                                logger.success("Database updated with compressed description", context={
+                                    "attribute": attr_name,
+                                    "original_kept": "YES - original description preserved",
+                                    "new_field": "description_compressed"
+                                })
+                            except Exception as e:
+                                logger.failure("Database update failed", context={
+                                    "attribute": attr_name,
+                                    "error": str(e),
+                                    "original_preview": original_desc[:100] + "...",
+                                    "compressed_preview": compressed_desc[:100] + "..."
+                                })
+                                stats['failed_count'] += 1
+                                stats['compressed_count'] -= 1
+                    else:
+                        stats['failed_count'] += 1
+                        logger.failure("Compression validation failed", context={
+                            "attribute": attr_name,
+                            "original_words": original_word_count,
+                            "compressed_result": compressed_desc[:100] + "..." if compressed_desc else "EMPTY/NULL",
+                            "issues": [
+                                "Empty result" if not compressed_desc or not compressed_desc.strip() else None,
+                                "No change" if compressed_desc == original_desc else None,
+                                "Not shorter" if compressed_desc and len(compressed_desc.split()) >= original_word_count else None
+                            ]
+                        })
+            
+            # Final summary
+            logger.section("COMPRESSION PROCESS COMPLETED")
+            logger.info("Final statistics", context={
+                "total_attributes_in_db": total_attributes_count,
+                "skipped_already_processed": stats['skipped_count'],
+                "attempted_compression": stats['total_processed'],
+                "successfully_compressed": stats['compressed_count'], 
+                "failed_compression": stats['failed_count'],
+                "success_rate": f"{(stats['compressed_count'] / max(stats['total_processed'], 1) * 100):.1f}%" if stats['total_processed'] > 0 else "0%"
+            })
+            
+            return {**stats, 'preview_samples': preview_samples}
+            
+        except Exception as e:
+            logger.failure("Critical error in batch compression", context={
+                "error": str(e),
+                "exception_type": type(e).__name__
+            })
+            import traceback
+            logger.error("Full traceback", context={"traceback": traceback.format_exc()})
+            return {'total_processed': 0, 'compressed_count': 0, 'failed_count': 1, 'skipped_count': 0}
 
 
 # Create shared service instance

@@ -314,6 +314,17 @@ class MongoDBClient:
             logger.error(f"MongoDB get documents failed: {e}")
             raise
 
+    def update_document(self, collection_name: str, query: Dict, update: Dict) -> None:
+        try:
+            with pymongo.MongoClient(self.uri) as client:
+                db = client[self.database]
+                collection = db[collection_name]
+                result = collection.update_one(query, update)
+                logger.info(f"Updated {result.modified_count} document(s) in '{collection_name}'")
+        except PyMongoError as e:
+            logger.error(f"MongoDB update failed: {e}")
+            raise
+
     def delete_documents(self, collection_name: str, query: Dict) -> None:
         try:
             with pymongo.MongoClient(self.uri) as client:

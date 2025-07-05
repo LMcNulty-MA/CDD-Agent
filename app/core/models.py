@@ -120,14 +120,15 @@ class TaskRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    version: str
+    version: str 
 
 # New models for front-end interface
 class SingleFieldCheckRequest(BaseModel):
     field_name: str = Field(..., description="The field name to check")
     field_definition: str = Field(..., description="The field definition/description")
     force_new_suggestion: Optional[bool] = Field(False, description="Force generation of new field suggestion instead of matching")
-    feedback_history: Optional[List[Dict[str, Any]]] = Field(None, description="Conversation history for feedback iteration")
+    feedback_text: Optional[str] = Field(None, description="User feedback to improve matching or new field creation")
+    action_type: Optional[str] = Field("find_matches", description="Action type: 'find_matches', 'create_new_field', 'improve_matches', 'improve_new_field'")
 
 class SingleFieldCheckResponse(BaseModel):
     field_name: str
@@ -136,6 +137,14 @@ class SingleFieldCheckResponse(BaseModel):
     new_field_suggestion: Optional[NewCDDFieldSuggestion] = Field(None)
     status: str = Field(..., description="Status: 'matched', 'new_suggestion', or 'no_match'")
     confidence_threshold: float = Field(default=0.6, description="Confidence threshold used")
+    feedback_applied: bool = Field(False, description="Whether feedback was applied in this response")
+
+# New model for single field new field download
+class SingleFieldNewFieldDownload(BaseModel):
+    field_name: str = Field(..., description="The original field name")
+    field_definition: str = Field(..., description="The original field definition")
+    new_field_suggestion: NewCDDFieldSuggestion = Field(..., description="The new field suggestion")
+    created_at: datetime = Field(default_factory=datetime.now, description="When the suggestion was created")
 
 class FileProcessingSession(BaseModel):
     session_id: str = Field(..., description="Unique session identifier")
@@ -186,3 +195,19 @@ class ExampleFileResponse(BaseModel):
     headers: Dict[str, str]
     sample_data: List[Dict[str, str]]
     description: str
+
+# Description Compression Models
+class DescriptionCompressionRequest(BaseModel):
+    compress_all: bool = Field(True, description="Compress all descriptions in database")
+    batch_size: int = Field(10, description="Batch processing size")
+    max_tokens: int = Field(40, description="Target token count per description")
+    dry_run: bool = Field(False, description="Preview changes without saving")
+
+class DescriptionCompressionResponse(BaseModel):
+    status: str = Field(..., description="Status: success, partial, failed")
+    total_processed: int = Field(..., description="Total attributes processed")
+    compressed_count: int = Field(..., description="Successfully compressed descriptions")
+    failed_count: int = Field(..., description="Failed compression attempts")
+    skipped_count: int = Field(..., description="Descriptions already short enough")
+    message: str = Field(..., description="Status message")
+    preview_samples: Optional[List[Dict[str, str]]] = Field(None, description="Sample compressions for dry run")
