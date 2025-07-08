@@ -396,28 +396,37 @@ class CDDMappingService:
             
             if match_results and match_results[0].confidence_score >= 0.6:
                 status = "matched"
-            
-        elif action_type in ["create_new_field", "improve_new_field"]:
+                
+        elif action_type == "create_new_field":
             # Create new field suggestion with optional feedback
-            suggestion_data = self.create_new_cdd_field_suggestion(
+            new_field_data = self.create_new_cdd_field_suggestion(
                 field_name, 
                 cleaned_definition, 
                 cdd_categories, 
-                cdd_attributes, 
+                cdd_attributes,
                 feedback_text=feedback_text
             )
             
-            if suggestion_data:
+            if new_field_data:
+                # Handle optional integer fields - convert empty strings to None
+                partition_key_order_raw = new_field_data.get('Partition Key Order')
+                partition_key_order = None
+                if partition_key_order_raw and str(partition_key_order_raw).strip():
+                    try:
+                        partition_key_order = int(partition_key_order_raw)
+                    except (ValueError, TypeError):
+                        partition_key_order = None
+                
                 new_field_suggestion = NewCDDFieldSuggestion(
-                    category=suggestion_data.get("Category", ""),
-                    attribute=suggestion_data.get("Attribute", ""),
-                    description=suggestion_data.get("Description", ""),
-                    label=suggestion_data.get("Label", ""),
-                    tag=suggestion_data.get("Tag", settings.DEFAULT_LABEL_TAG),
-                    action=suggestion_data.get("New-Update-Deprecate", "New"),
-                    partition_key_order=None,
-                    index_key=None,
-                    data_type=suggestion_data.get("data_type", "STRING")
+                    category=new_field_data['Category'],
+                    attribute=new_field_data['Attribute'],
+                    description=new_field_data['Description'],
+                    label=new_field_data['Label'],
+                    data_type=new_field_data.get('data_type'),
+                    tag=new_field_data.get('Tag', 'ZM'),
+                    action=new_field_data.get('New-Update-Deprecate', 'New'),
+                    partition_key_order=partition_key_order,
+                    index_key=new_field_data.get('Index Key')
                 )
                 status = "new_suggestion"
         
@@ -427,9 +436,123 @@ class CDDMappingService:
             matches=match_results,
             new_field_suggestion=new_field_suggestion,
             status=status,
-            confidence_threshold=0.6,
             feedback_applied=feedback_applied
         )
+
+    def check_bulk_fields(self, fields: List[Dict[str, str]], feedback_text: Optional[str] = None) -> Dict[str, List[Dict]]:
+        """Check multiple fields at once using bulk processing for improved performance"""
+        if not HAS_OPENAI or not client:
+            print("OpenAI not available, returning empty results")
+            return {}
+        
+        if not fields:
+            return {}
+        
+        # Get CDD data
+        cdd_attributes, _ = self.get_all_cdd_data_from_db()
+        
+        # Clean field definitions
+        cleaned_fields = []
+        for field in fields:
+            cleaned_field = {
+                'field_name': field['field_name'],
+                'field_definition': self._clean_field_definition(field['field_definition'])
+            }
+            cleaned_fields.append(cleaned_field)
+        
+        # Filter out fields with insufficient context
+        processable_fields = []
+        for field in cleaned_fields:
+            is_sufficient, cleaned_def = self._is_field_definition_sufficient(
+                field['field_name'], 
+                field['field_definition']
+            )
+            if is_sufficient:
+                processable_fields.append({
+                    'field_name': field['field_name'],
+                    'field_definition': cleaned_def
+                })
+            else:
+                print(f"⚠️  Insufficient context for field '{field['field_name']}': {cleaned_def}")
+        
+        if not processable_fields:
+            print("No fields with sufficient context for bulk processing")
+            return {}
+        
+        # Create context for matching
+        context = self._create_optimized_matching_context(cdd_attributes)
+        
+        # Use bulk prompt builder
+        prompt_builder = get_prompt_builder()
+        prompt = prompt_builder.build_bulk_field_matching_prompt(
+            fields=processable_fields,
+            context=context,
+            max_matches=5,
+            feedback_text=feedback_text
+        )
+        
+        try:
+            # Prepare API call parameters
+            api_params = {
+                "model": settings.MODEL_TO_USE,
+                "messages": [
+                    {"role": "system", "content": get_system_message("field_matching_expert")},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 2000,  # Increased for bulk processing
+            }
+            
+            # Only add temperature for models that support it
+            if settings.MODEL_TO_USE not in ["gpt-4o-mini", "o1-mini", "o1-preview"]:
+                api_params["temperature"] = 0.1
+            
+            response = client.chat.completions.create(**api_params)
+            
+            result = response.choices[0].message.content.strip()
+            
+            # Save prompt and response for debugging
+            if settings.SAVE_PROMPTS_TO_FILE:
+                suffix = "_with_feedback" if feedback_text else ""
+                output_file = os.path.join(os.path.dirname(__file__), "..", "..", "prompts_out", f"bulk_matching_prompt{suffix}.txt")
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                save_prompt_and_response(prompt, output_file, result)
+                print(f"💾 Saved bulk matching prompt to: {output_file}")
+            
+            bulk_results = self._parse_json_response(result)
+            
+            if not bulk_results:
+                return {}
+            
+            # Process and enrich results
+            enriched_results = {}
+            for field_name, matches in bulk_results.items():
+                if not matches:
+                    enriched_results[field_name] = []
+                    continue
+                
+                # Enrich matches with CDD field info
+                enriched_matches = []
+                for match in matches:
+                    cdd_info = self._get_cdd_field_info(match['cdd_field'], cdd_attributes)
+                    if cdd_info:
+                        enriched_match = {
+                            'name': match['cdd_field'],
+                            'confidence_score': match['confidence_score'],
+                            'reasoning': match.get('reasoning', ''),
+                            'description': cdd_info.get('description', ''),
+                            'category': cdd_info.get('category', ''),
+                            'data_type': cdd_info.get('dataType', ''),
+                            'display_name': cdd_info.get('displayName', '')
+                        }
+                        enriched_matches.append(enriched_match)
+                
+                enriched_results[field_name] = sorted(enriched_matches, key=lambda x: x['confidence_score'], reverse=True)
+            
+            return enriched_results
+            
+        except Exception as e:
+            print(f"Error in bulk field processing: {e}")
+            return {}
 
     def compress_attribute_description(self, description: str, field_name: str = "", data_type: str = "", display_name: str = "", max_tokens: Optional[int] = None) -> str:
         """Compress a single attribute description using AI while preserving key information"""

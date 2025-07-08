@@ -1,11 +1,11 @@
 import uvicorn
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import ValidationError
 
 # In house imports
@@ -47,18 +47,29 @@ def get_application() -> FastAPI:
     application.include_router(health.router, prefix=f'/{api_context}')
     application.include_router(web_interface.router, prefix=f'/{api_context}/web')
 
-    # Exception handlers (basic ones for now)
+    # Exception handlers - properly return JSONResponse objects
     @application.exception_handler(HTTPException)
-    async def http_exception_handler(request, exc):
-        return {"error": exc.detail, "status_code": exc.status_code}
+    async def http_exception_handler(request: Request, exc: HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=getattr(exc, 'headers', None)
+        )
 
     @application.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request, exc):
-        return {"error": "Validation error", "details": str(exc)}
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Validation error", "errors": exc.errors()}
+        )
 
     @application.exception_handler(Exception)
-    async def generic_exception_handler(request, exc):
-        return {"error": "Internal server error", "details": str(exc)}
+    async def generic_exception_handler(request: Request, exc: Exception):
+        logging.error(f"Unhandled exception: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error"}
+        )
 
     # Custom Swagger UI with dark theme support
     @application.get(f"/{api_context}/docs", include_in_schema=False)

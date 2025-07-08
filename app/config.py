@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # Performance optimization
     MAX_ATTRIBUTES_FOR_MATCHING: int = 50  # Reduce prompt size for better performance
     
+    # Bulk processing settings
+    BULK_FIELD_BATCH_SIZE: int = 5  # Number of fields to process in bulk (3-5 recommended)
+    
     # Description compression settings
     COMPRESSION_MODEL: str = "o4-mini"  # Small, fast model for compression
     MAX_DESCRIPTION_TOKENS: int = 40        # Target compression size

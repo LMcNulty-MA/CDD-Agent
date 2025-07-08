@@ -58,7 +58,7 @@ class _PublicKeys:
         response = requests.get(urljoin(settings.GLOBAL_SSO_SERVICE_URL, 'sso-api/auth/certs'))
         response.raise_for_status()
 
-        jwks = json.loads(response.content.decode(response.encoding))
+        jwks = json.loads(response.content.decode(response.encoding or 'utf-8'))
 
         return dict([(jwk['kid'], self._get_authentication_public_key(jwk)) for jwk in jwks['keys']])
 
@@ -118,6 +118,13 @@ class JWTBearer(HTTPBearer):
         :raises: An HTTPException with a 403 error code if no authentication header is provided
         """
         authorization_scheme_param = await super().__call__(request)
+        
+        if authorization_scheme_param is None:
+            raise HTTPException(
+                status_code=401, 
+                detail='Authentication required', 
+                headers={'WWW-Authenticate': 'Bearer'}
+            )
 
         token_data = TokenData(
             token=authorization_scheme_param.credentials, payload=self._decode(authorization_scheme_param.credentials)
@@ -136,21 +143,43 @@ class JWTBearer(HTTPBearer):
         :param token: The token to be decoded
         :return: The decoded token's payload
         """
+        last_error = None
+        expired_error = None
+        
         for k, jwk in self._public_keys().items():
             try:
-                return jwt.decode(token, key=jwk, options=self._options, algorithms='RS256')
-            except InvalidSignatureError:
+                return jwt.decode(token, key=jwk, options=self._options, algorithms=['RS256'])
+            except InvalidSignatureError as err:
                 log.info('JWK %s cannot be used for token: %s', k, token)
+                last_error = err
+            except jwt.ExpiredSignatureError as err:
+                log.info('Token has expired for JWK %s', k)
+                expired_error = err
+                last_error = err
+            except (jwt.InvalidTokenError, jwt.DecodeError) as err:
+                log.info('Invalid token format for JWK %s: %s', k, str(err))
+                last_error = err
             except Exception as err:
                 log.info('Error "%s" when parsing token %s', err, token)
+                last_error = err
+
+        # Provide specific error message for expired tokens
+        if expired_error:
+            raise HTTPException(
+                status_code=401, 
+                detail='Token has expired. Please refresh your authentication.',
+                headers={'WWW-Authenticate': 'Bearer'}
+            )
 
         raise HTTPException(
-            status_code=401, detail='Invalid authorization token', headers={'WWW-Authenticate': 'Bearer'}
+            status_code=401, 
+            detail='Invalid authorization token', 
+            headers={'WWW-Authenticate': 'Bearer'}
         )
 
 class Permissions:
 
-    def __init__(self, entitlements: set[str] = None, roles: set[str] = None) -> None:
+    def __init__(self, entitlements: Optional[set[str]] = None, roles: Optional[set[str]] = None) -> None:
         self._entitlements = entitlements
         self._roles = roles
 

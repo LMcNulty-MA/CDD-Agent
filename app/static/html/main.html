@@ -33,6 +33,9 @@
                     <span id="authLoadingIcon" class="loading hidden"></span>
                     Authenticate
                 </button>
+                <button class="btn btn-secondary" onclick="clearToken()">
+                    🗑️ Clear Token
+                </button>
                 <div id="authStatus" class="inline-alert hidden"></div>
             </div>
         </div>
@@ -41,15 +44,13 @@
         <div id="mainInterface" class="hidden">
             <!-- Example Files Section (moved to top) -->
             <div class="card">
-                <h2>📋 Example Files</h2>
+                <h2>📋 Example File</h2>
                 <p style="margin-bottom: 20px;">
-                    Download example files to see the required format for bulk processing.
+                    Download an example Excel file to see the required format for bulk processing. 
+                    The file contains two tabs: "fields_to_map" for your input fields and "new_suggested_fields" for new field suggestions.
                 </p>
-                <button class="btn btn-secondary" onclick="downloadExampleFile('csv')">
-                    📄 Download CSV Example
-                </button>
-                <button class="btn btn-secondary" onclick="downloadExampleFile('json')">
-                    📋 Download JSON Example
+                <button class="btn btn-secondary" onclick="downloadExampleFile()">
+                    📄 Download Excel Example
                 </button>
             </div>
             
@@ -57,30 +58,23 @@
             <div class="card">
                 <h2>📁 Bulk File Processing</h2>
                 <p style="margin-bottom: 20px;">
-                    Upload a CSV or JSON file to process multiple fields at once, just like the command line tool.
+                    Upload an Excel file (.xlsx) to process multiple fields at once. The file should have a "fields_to_map" tab with your field data.
                 </p>
                 
                 <!-- File Upload -->
                 <div id="fileUploadSection">
                     <div class="form-group">
-                        <label for="fileInput">Select File (CSV or JSON):</label>
-                        <input type="file" id="fileInput" accept=".csv,.json" onchange="handleFileSelect(event)">
+                        <label for="fileInput">Select Excel File (.xlsx):</label>
+                        <input type="file" id="fileInput" accept=".xlsx" onchange="handleFileSelect(event)">
                     </div>
                     
-                    <div class="form-group">
-                        <label for="outputFormat">New Fields Output Format:</label>
-                        <select id="outputFormat">
-                            <option value="csv">CSV</option>
-                            <option value="json">JSON</option>
-                        </select>
+                    <div class="action-buttons">
+                        <button class="btn" onclick="uploadFile()" id="uploadBtn" disabled>
+                            <span id="uploadLoadingIcon" class="loading hidden"></span>
+                            Upload & Start Processing
+                        </button>
+                        <div id="uploadStatus" class="inline-alert hidden"></div>
                     </div>
-                    
-                    <button class="btn" onclick="uploadFile()" id="uploadBtn" disabled>
-                        <span id="uploadLoadingIcon" class="loading hidden"></span>
-                        Upload & Start Processing
-                    </button>
-                    
-                    <div id="uploadStatus" class="hidden"></div>
                 </div>
                 
                 <!-- Processing Interface (hidden initially) -->
@@ -159,17 +153,14 @@
                         <!-- Loading State -->
                         <div id="loadingNextField" class="loading-section hidden">
                             <div class="loading-spinner"></div>
-                            <p>Loading next field...</p>
+                            <p id="loadingMessage">Loading next field...</p>
                         </div>
                     </div>
                     
                     <!-- Session Controls -->
                     <div class="session-controls">
-                        <button class="btn btn-success" onclick="downloadFiles('updated_input')" id="downloadInputBtn">
-                            📥 Download Updated Input File
-                        </button>
-                        <button class="btn btn-success" onclick="downloadFiles('new_fields')" id="downloadNewFieldsBtn">
-                            📥 Download New Fields
+                        <button class="btn btn-success" onclick="downloadFiles()" id="downloadBtn">
+                            📥 Download Updated Mapping File
                         </button>
                         <button class="btn btn-danger" onclick="exitProcessing()">
                             🚪 Exit Processing
@@ -252,11 +243,8 @@
                                     <span id="improveSingleFieldNewFieldIcon" class="loading hidden"></span>
                                     🔄 Improve New Field
                                 </button>
-                                <button class="btn btn-success" onclick="downloadSingleFieldNewField('csv')">
-                                    📥 Download CSV
-                                </button>
-                                <button class="btn btn-success" onclick="downloadSingleFieldNewField('json')">
-                                    📥 Download JSON
+                                <button class="btn btn-success" onclick="downloadSingleFieldNewField()">
+                                    📥 Download Excel
                                 </button>
                                 <div id="singleFieldNewFieldInlineAlert" class="inline-alert hidden"></div>
                             </div>
@@ -267,6 +255,6 @@
         </div>
     </div>
     
-    <script src="/cdd-agent/web/static/js/main.js"></script>
+    <script src="/cdd-agent/web/static/js/main.js?v=20250107"></script>
 </body>
 </html> 

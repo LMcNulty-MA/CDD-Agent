@@ -1,14 +1,85 @@
 // Global variables
-let authToken = '';
-let currentSessionId = '';
+let authToken = null;
+let currentSessionId = null;
 let selectedFile = null;
 let currentMatches = [];
 let currentNewFieldSuggestion = null;
 let feedbackHistory = [];
 let currentSingleFieldResult = null;
-let isProcessingField = false;  // Add processing lock
-let lastProcessTime = 0;        // Add cooldown tracking
-let currentFieldData = null; // Store current field data
+let isProcessingField = false;  // Prevent rapid field processing
+let lastProcessTime = 0;        // Track timing for rate limiting
+let currentFieldData = null;    // Store current field data for processing
+let batchSize = 5;              // Batch size for bulk processing (updated from server)
+
+// Global error handler for API responses
+async function handleApiResponse(response, operation = 'API call') {
+    if (response.status === 401) {
+        // Token expired or invalid
+        console.log('Token expired, clearing authentication');
+        authToken = null;
+        localStorage.removeItem('cdd_auth_token');
+        
+        // Hide main interface and show auth interface
+        document.getElementById('mainInterface').classList.add('hidden');
+        document.getElementById('authToken').value = '';
+        
+        // Show user-friendly message
+        showAlert('authStatus', 'Your session has expired. Please enter your authentication token again.', 'error');
+        
+        // Clear any ongoing sessions
+        currentSessionId = null;
+        
+        // Reset processing state
+        lastBulkProcessedIndex = -1;
+        
+        throw new Error('Authentication expired');
+    }
+    
+    if (!response.ok) {
+        let errorMessage = `${operation} failed`;
+        try {
+            const errorData = await response.json();
+            errorMessage = errorData.detail || errorData.message || errorMessage;
+        } catch (e) {
+            // If we can't parse error response, use generic message
+            errorMessage = `${operation} failed (${response.status}: ${response.statusText})`;
+        }
+        throw new Error(errorMessage);
+    }
+    
+    return response;
+}
+
+// Initialize page on load
+document.addEventListener('DOMContentLoaded', function() {
+    // Load saved token from localStorage
+    const savedToken = localStorage.getItem('cdd_auth_token');
+    if (savedToken) {
+        authToken = savedToken;
+        document.getElementById('authToken').value = savedToken;
+        // Automatically show main interface if token exists
+        document.getElementById('mainInterface').classList.remove('hidden');
+        showAlert('authStatus', 'Authentication token loaded from previous session', 'success');
+    }
+    
+    // Initialize theme
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme === 'dark') {
+        document.body.classList.add('dark-theme');
+        document.getElementById('theme-toggle').checked = true;
+    }
+    
+    // Theme toggle event listener
+    document.getElementById('theme-toggle').addEventListener('change', function(e) {
+        if (e.target.checked) {
+            document.body.classList.add('dark-theme');
+            localStorage.setItem('theme', 'dark');
+        } else {
+            document.body.classList.remove('dark-theme');
+            localStorage.setItem('theme', 'light');
+        }
+    });
+});
 
 // Theme toggle functionality
 document.addEventListener('DOMContentLoaded', function() {
@@ -108,43 +179,42 @@ function enableAllInteraction() {
 
 // Authentication
 async function authenticateUser() {
-    const token = document.getElementById('authToken').value.trim();
-    if (!token) {
-        showAlert('authStatus', 'Please enter an authentication token', 'error');
+    const tokenInput = document.getElementById('authToken').value.trim();
+    
+    if (!tokenInput) {
+        showAlert('authStatus', 'Please enter your authentication token', 'error');
         return;
     }
     
     showLoading('authLoadingIcon', true);
     
     try {
-        // Test authentication by making a simple API call
+        // Test the token by making a request to the categories endpoint
         const response = await fetch('/cdd-agent/categories', {
             headers: {
-                'Authorization': `Bearer ${token}`
+                'Authorization': `Bearer ${tokenInput}`
             }
         });
         
-        if (response.ok) {
-            authToken = token;
-            showAlert('authStatus', 'Authentication successful!', 'success');
-            document.getElementById('mainInterface').classList.remove('hidden');
-        } else {
-            const errorData = await response.json().catch(() => ({}));
-            let errorMessage = 'Authentication failed';
-            
-            if (response.status === 401 || response.status === 403) {
-                errorMessage = 'Invalid authentication token. Please check your token and try again.';
-            } else if (errorData.detail) {
-                errorMessage = errorData.detail;
-            } else if (response.status === 422) {
-                errorMessage = 'There was an issue with your request. Please try again.';
-            }
-            
-            showAlert('authStatus', errorMessage, 'error');
-        }
+        await handleApiResponse(response, 'Authentication');
+        
+        authToken = tokenInput;
+        // Save token to localStorage
+        localStorage.setItem('cdd_auth_token', tokenInput);
+        
+        showAlert('authStatus', 'Authentication successful! 🎉', 'success');
+        document.getElementById('mainInterface').classList.remove('hidden');
+        
     } catch (error) {
         console.error('Authentication error:', error);
-        showAlert('authStatus', 'Unable to connect to the server. Please check your connection and try again.', 'error');
+        // Clear saved token on error
+        localStorage.removeItem('cdd_auth_token');
+        
+        if (error.message === 'Authentication expired') {
+            showAlert('authStatus', 'Invalid token. Please check your authentication token and try again.', 'error');
+        } else {
+            showAlert('authStatus', 'Unable to authenticate. Please check your connection and try again.', 'error');
+        }
     }
     
     showLoading('authLoadingIcon', false);
@@ -154,17 +224,17 @@ async function authenticateUser() {
 function handleFileSelect(event) {
     const file = event.target.files[0];
     if (file) {
-        const allowedTypes = ['.csv', '.json'];
+        const allowedTypes = ['.xlsx'];
         const fileExtension = '.' + file.name.split('.').pop().toLowerCase();
         
         if (allowedTypes.includes(fileExtension)) {
             selectedFile = file;
             document.getElementById('uploadBtn').disabled = false;
-            showAlert('uploadStatus', `Selected: ${file.name} (${fileExtension.toUpperCase()})`, 'info');
+            showAlert('uploadStatus', `Selected: ${file.name} (Excel file)`, 'info');
         } else {
             selectedFile = null;
             document.getElementById('uploadBtn').disabled = true;
-            showAlert('uploadStatus', 'Please select a CSV or JSON file only.', 'error');
+            showAlert('uploadStatus', 'Please select an Excel (.xlsx) file only.', 'error');
         }
     }
 }
@@ -189,31 +259,30 @@ async function uploadFile() {
             body: formData
         });
         
+        await handleApiResponse(response, 'File upload');
         const result = await response.json();
         
-        if (response.ok) {
-            currentSessionId = result.session_id;
-            showAlert('uploadStatus', result.message, 'success');
-            
-            // Hide upload section and show processing interface
-            hideElement('fileUploadSection');
-            showElement('processingInterface');
-            
-            // Start processing the first field
-            await loadNextField();
-        } else {
-            let errorMessage = 'Failed to upload file';
-            
-            if (response.status === 401 || response.status === 403) {
-                errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                document.getElementById('mainInterface').classList.add('hidden');
-                authToken = null;
-            } else if (result.detail) {
-                errorMessage = result.detail;
-            }
-            
-            showAlert('uploadStatus', errorMessage, 'error');
-        }
+        currentSessionId = result.session_id;
+        
+        // Reset state for new session
+        batchSize = 5; // Default batch size, will be updated from server
+        currentMatches = [];
+        currentNewFieldSuggestion = null;
+        currentFieldData = null;
+        isProcessingField = false;
+        lastProcessTime = 0;
+        feedbackHistory = [];
+        
+        console.log('🧹 State reset for new session');
+        showAlert('uploadStatus', result.message, 'success');
+        
+        // Hide upload section and show processing interface
+        hideElement('fileUploadSection');
+        showElement('processingInterface');
+        
+        // Start by loading the first field (which will trigger bulk processing if needed)
+        await loadNextField();
+        
     } catch (error) {
         console.error('Upload error:', error);
         showAlert('uploadStatus', 'Unable to upload file. Please check your connection and try again.', 'error');
@@ -222,9 +291,46 @@ async function uploadFile() {
     showLoading('uploadLoadingIcon', false);
 }
 
-// Field processing
-async function loadNextField() {
-    console.log('⏭️ loadNextField called');
+function selectMatch(index, retryCount = 0) {
+    console.log(`🖱️ selectMatch called with index: ${index}, retryCount: ${retryCount}`);
+    
+    // Prevent rapid clicks - check if we're already processing
+    if (isProcessingField) {
+        console.log('❌ Already processing field, ignoring selectMatch');
+        return;
+    }
+    
+    // Remove previous selections
+    document.querySelectorAll('.match-item').forEach(item => {
+        item.classList.remove('selected');
+    });
+    
+    // Select current match
+    const matchItems = document.querySelectorAll('.match-item');
+    if (matchItems[index]) {
+        matchItems[index].classList.add('selected');
+    }
+    
+    // Automatically accept the match and move to next field
+    // Add a small delay to ensure UI update is complete
+    console.log('✅ Auto-accepting match at index:', index);
+    setTimeout(() => {
+        acceptMatch(index);
+    }, 100); // Small delay to ensure UI is updated
+}
+
+
+
+
+// Bulk field processing
+async function processBulkFields() {
+    console.log('🚀 Processing next batch of fields...');
+    
+    // Update loading message to show batch processing
+    const loadingMessage = document.getElementById('loadingMessage');
+    if (loadingMessage) {
+        loadingMessage.textContent = `Loading next ${batchSize} fields...`;
+    }
     
     showElement('loadingNextField');
     hideElement('matchesSection');
@@ -233,7 +339,67 @@ async function loadNextField() {
     // Clear previous state
     currentMatches = [];
     currentNewFieldSuggestion = null;
-    currentFieldData = null; // Clear previous field data
+    currentFieldData = null;
+    
+    try {
+        const response = await fetch(`/cdd-agent/web/session/${currentSessionId}/bulk-process`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams({
+                feedback_text: ''
+            })
+        });
+        
+        await handleApiResponse(response, 'Bulk process fields');
+        
+        const data = await response.json();
+        console.log('Bulk processing response:', data);
+        
+        showAlert('uploadStatus', 
+            `✅ Processed ${data.total_processed} fields in ${data.processing_time.toFixed(2)}s`, 
+            'success'
+        );
+        
+        // Update batch size from server response
+        if (data.results && data.results.length > 0) {
+            batchSize = data.total_processed;
+            console.log(`📊 Processed ${data.total_processed} fields in this batch`);
+        }
+        
+        // Now load the next field
+        await loadNextField();
+        
+    } catch (error) {
+        console.error('Error in bulk processing:', error);
+        showAlert('uploadStatus', 'Failed to process bulk fields: ' + error.message, 'error');
+        hideElement('loadingNextField');
+        
+        // Fallback to single field processing
+        await loadNextField();
+    }
+}
+
+// Field processing
+async function loadNextField() {
+    console.log('⏭️ loadNextField called');
+    
+    // Reset loading message to generic message
+    const loadingMessage = document.getElementById('loadingMessage');
+    if (loadingMessage) {
+        loadingMessage.textContent = 'Loading next field...';
+    }
+    
+    showElement('loadingNextField');
+    hideElement('matchesSection');
+    hideElement('newFieldSection');
+    
+    // Clear previous state
+    currentMatches = [];
+    currentNewFieldSuggestion = null;
+    currentFieldData = null;
     
     // Clear feedback inputs
     const bulkMatchFeedback = document.getElementById('bulkMatchFeedback');
@@ -242,7 +408,7 @@ async function loadNextField() {
     if (bulkNewFieldFeedback) bulkNewFieldFeedback.value = '';
     
     try {
-        console.log('Fetching next field for session:', currentSessionId);
+        console.log('🔄 Fetching next field for session:', currentSessionId);
         
         const response = await fetch(`/cdd-agent/web/session/${currentSessionId}/next-field`, {
             headers: {
@@ -250,16 +416,13 @@ async function loadNextField() {
             }
         });
         
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
+        await handleApiResponse(response, 'Load next field');
         const data = await response.json();
-        console.log('Next field response:', data);
+        console.log('📥 Next field response:', data);
         
         if (data.status === 'completed') {
             // Session completed
-            console.log('Session completed, showing results');
+            console.log('🎉 Session completed, showing results');
             showElement('sessionCompleted');
             hideElement('currentFieldSection');
             return;
@@ -267,27 +430,44 @@ async function loadNextField() {
         
         // Store current field data for use by createNewField
         currentFieldData = data.current_field;
-        console.log('Stored current field data:', currentFieldData);
+        console.log('💾 Stored current field data:', currentFieldData);
         
         // Update progress
         if (data.progress) {
             updateProgressBar(data.progress.total, data.progress.processed);
         }
         
+        // Update batch size from server response
+        if (data.batch_info && data.batch_info.batch_size) {
+            batchSize = data.batch_info.batch_size;
+        }
+        
         // Display current field
         displayCurrentField(data.current_field);
         
-        // Display matches if they exist (they come with the field response now)
-        if (data.current_field.matches && data.current_field.matches.length > 0) {
-            console.log('Displaying matches from field response:', data.current_field.matches);
+        // Check if we need bulk processing for this field
+        if (data.batch_info && data.batch_info.need_bulk_processing) {
+            console.log('🚀 Need bulk processing for current batch');
+            // Trigger batch processing
+            setTimeout(() => {
+                processBulkFields();
+            }, 500); // Small delay to let current field display
+            return;
+        }
+        
+        // Display matches if they exist and are processed
+        if (data.current_field.matches && data.current_field.matches.length > 0 && data.current_field.processed) {
+            console.log('📋 Displaying matches from field response:', data.current_field.matches);
             currentMatches = data.current_field.matches;
             displayMatches(data.current_field.matches);
             showElement('matchesSection');
-        } else {
-            console.log('No matches found for this field');
+        } else if (data.current_field.processed) {
+            console.log('❌ No matches found for this field');
             showElement('matchesSection');
             const matchesList = document.getElementById('matchesList');
             matchesList.innerHTML = '<p>No good matches found for this field.</p>';
+        } else {
+            console.log('⏳ Field not yet processed, waiting for bulk processing');
         }
         
         // Store new field suggestion if it exists
@@ -300,7 +480,7 @@ async function loadNextField() {
         showElement('currentFieldSection');
         
     } catch (error) {
-        console.error('Error loading next field:', error);
+        console.error('❌ Error loading next field:', error);
         showAlert('uploadStatus', 'Failed to load next field: ' + error.message, 'error');
         hideElement('loadingNextField');
     }
@@ -315,12 +495,14 @@ async function improveMatches() {
     }
     
     showLoading('improveBulkMatchesIcon', true);
+    disableAllInteraction(); // Prevent user interactions during processing
     
     // Use stored current field data instead of calling getCurrentFieldData()
     if (!currentFieldData) {
         console.log('No current field data available for improve matches');
         showAlert('uploadStatus', 'No current field data available. Please try again.', 'error');
         showLoading('improveBulkMatchesIcon', false);
+        enableAllInteraction(); // Re-enable interactions before returning
         return;
     }
     
@@ -339,6 +521,7 @@ async function improveMatches() {
             })
         });
         
+        await handleApiResponse(response, 'Improve matches');
         const result = await response.json();
         
         if (response.ok) {
@@ -367,15 +550,17 @@ async function improveMatches() {
     } catch (error) {
         console.error('Error in improveMatches:', error);
         showAlert('uploadStatus', 'Unable to improve matches. Please try again.', 'error');
+    } finally {
+        showLoading('improveBulkMatchesIcon', false);
+        enableAllInteraction(); // Re-enable user interactions
     }
-    
-    showLoading('improveBulkMatchesIcon', false);
 }
 
 async function createNewField() {
     console.log('=== createNewField called ===');
     
     showLoading('newFieldLoadingIcon', true);
+    disableAllInteraction(); // Prevent user interactions during processing
     
     try {
         // Use stored current field data instead of calling getCurrentFieldData()
@@ -383,6 +568,7 @@ async function createNewField() {
             console.log('No current field data available');
             showAlert('uploadStatus', 'No current field data available. Please try again.', 'error');
             showLoading('newFieldLoadingIcon', false);
+            enableAllInteraction(); // Re-enable interactions before returning
             return;
         }
         
@@ -404,6 +590,7 @@ async function createNewField() {
             body: JSON.stringify(requestBody)
         });
         
+        await handleApiResponse(response, 'Create new field');
         const result = await response.json();
         console.log('📥 RECEIVED RESPONSE:', result);
         
@@ -421,9 +608,10 @@ async function createNewField() {
     } catch (error) {
         console.error('EXCEPTION in createNewField:', error);
         showAlert('uploadStatus', 'Unable to create new field. Please try again.', 'error');
+    } finally {
+        showLoading('newFieldLoadingIcon', false);
+        enableAllInteraction(); // Re-enable user interactions
     }
-    
-    showLoading('newFieldLoadingIcon', false);
 }
 
 async function improveNewField() {
@@ -435,12 +623,14 @@ async function improveNewField() {
     }
     
     showLoading('improveBulkNewFieldIcon', true);
+    disableAllInteraction(); // Prevent user interactions during processing
     
     // Use stored current field data instead of calling getCurrentFieldData()
     if (!currentFieldData) {
         console.log('No current field data available for improve new field');
         showAlert('uploadStatus', 'No current field data available. Please try again.', 'error');
         showLoading('improveBulkNewFieldIcon', false);
+        enableAllInteraction(); // Re-enable interactions before returning
         return;
     }
     
@@ -459,9 +649,10 @@ async function improveNewField() {
             })
         });
         
+        await handleApiResponse(response, 'Improve new field');
         const result = await response.json();
         
-        if (response.ok && result.new_field_suggestion) {
+        if (result.new_field_suggestion) {
             console.log('Improved new field suggestion:', result.new_field_suggestion);
             currentNewFieldSuggestion = result.new_field_suggestion;
             displayNewFieldSuggestion(result.new_field_suggestion);
@@ -469,14 +660,15 @@ async function improveNewField() {
             document.getElementById('bulkNewFieldFeedback').value = '';
         } else {
             console.error('Error improving new field:', result);
-            showAlert('uploadStatus', result.detail || 'Failed to improve new field', 'error');
+            showAlert('uploadStatus', 'Failed to improve new field', 'error');
         }
     } catch (error) {
         console.error('Error in improveNewField:', error);
         showAlert('uploadStatus', 'Unable to improve new field. Please try again.', 'error');
+    } finally {
+        showLoading('improveBulkNewFieldIcon', false);
+        enableAllInteraction(); // Re-enable user interactions
     }
-    
-    showLoading('improveBulkNewFieldIcon', false);
 }
 
 function updateProgressBar(total, processed) {
@@ -525,28 +717,20 @@ function displayMatches(matches) {
     });
 }
 
-function selectMatch(index) {
-    // Remove previous selections
-    document.querySelectorAll('.match-item').forEach(item => {
-        item.classList.remove('selected');
-    });
-    
-    // Select current match
-    document.querySelectorAll('.match-item')[index].classList.add('selected');
-    
-    // Automatically accept the match and move to next field
-    console.log('Auto-accepting match at index:', index);
-    acceptMatch(index);
-}
-
 async function acceptMatch(index) {
     console.log('=== acceptMatch called with index:', index);
     console.trace('acceptMatch call stack');
     
-    // Prevent rapid processing
+    // Prevent rapid processing - but only if we're already processing
+    if (isProcessingField) {
+        console.log('Skipping acceptMatch - already processing field');
+        return;
+    }
+    
+    // Prevent rapid successive clicks (reduce from 2000ms to 500ms for better UX)
     const now = Date.now();
-    if (isProcessingField || (now - lastProcessTime) < 2000) {
-        console.log('Skipping acceptMatch - too soon or already processing');
+    if ((now - lastProcessTime) < 500) {
+        console.log('Skipping acceptMatch - too soon since last process');
         return;
     }
     
@@ -577,23 +761,18 @@ async function acceptMatch(index) {
             body: formData
         });
         
+        await handleApiResponse(response, 'Accept match');
         const result = await response.json();
         
-        if (response.ok) {
-            console.log('Accept match successful, moving to next field');
-            // Clear current matches for next field
-            currentMatches = [];
-            
-            // Hide matches section
-            hideElement('matchesSection');
-            
-            // Move to next field
-            await loadNextField();
-        } else {
-            console.error('Error accepting match:', result);
-            showAlert('uploadStatus', 'Error accepting match. Please try again.', 'error');
-            hideElement('loadingNextField');
-        }
+        console.log('Accept match successful, moving to next field');
+        // Clear current matches for next field
+        currentMatches = [];
+        
+        // Hide matches section
+        hideElement('matchesSection');
+        
+        // Move to next field
+        await loadNextField();
     } catch (error) {
         console.error('Error accepting match:', error);
         showAlert('uploadStatus', 'Unable to accept match. Please check your connection.', 'error');
@@ -629,68 +808,118 @@ function displayNewFieldSuggestion(suggestion) {
 }
 
 // File downloads
-async function downloadFiles(fileType) {
-    const outputFormat = document.getElementById('outputFormat').value;
-    
+async function downloadFiles() {
     try {
-        const response = await fetch(`/cdd-agent/web/session/${currentSessionId}/download?file_type=${fileType}&format=${outputFormat}`, {
+        const response = await fetch(`/cdd-agent/web/session/${currentSessionId}/download`, {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
         });
         
-        if (response.ok) {
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            
-            // Set filename based on file type
-            let filename = '';
-            if (fileType === 'updated_input') {
-                filename = `updated_input_file.${outputFormat}`;
-            } else {
-                filename = `new_field_suggestions.${outputFormat}`;
-            }
-            
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-        } else {
-            const errorData = await response.json().catch(() => ({}));
-            let errorMessage = 'Failed to download file';
-            
-            if (response.status === 404) {
-                errorMessage = 'No data available for download yet.';
-            } else if (errorData.detail) {
-                errorMessage = errorData.detail;
-            }
-            
-            showAlert('uploadStatus', errorMessage, 'error');
+        await handleApiResponse(response, 'Download files');
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        
+        // Create filename with original name and local timestamp
+        let filename = 'updated_mapping_file.xlsx';
+        if (selectedFile && selectedFile.name) {
+            // Get original filename without extension
+            const originalName = selectedFile.name.replace(/\.[^/.]+$/, '');
+            // Create local timestamp
+            const now = new Date();
+            const timestamp = now.getFullYear() + 
+                String(now.getMonth() + 1).padStart(2, '0') + 
+                String(now.getDate()).padStart(2, '0') + '_' +
+                String(now.getHours()).padStart(2, '0') + 
+                String(now.getMinutes()).padStart(2, '0') + 
+                String(now.getSeconds()).padStart(2, '0');
+            filename = `${originalName}_${timestamp}.xlsx`;
         }
+        
+        a.download = filename;
+        
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        
+        showAlert('uploadStatus', `Updated mapping file downloaded: ${filename}`, 'success');
+        
     } catch (error) {
         console.error('Download error:', error);
         showAlert('uploadStatus', 'Unable to download file. Please check your connection.', 'error');
     }
 }
 
-function exitProcessing() {
-    if (confirm('Are you sure you want to exit processing? You can download your current progress files.')) {
-        // Reset the interface
-        hideElement('processingInterface');
-        showElement('fileUploadSection');
+async function clearSession() {
+    if (!currentSessionId) {
+        console.log('No active session to clear');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/cdd-agent/web/session/${currentSessionId}`, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
         
-        // Reset form
-        document.getElementById('fileInput').value = '';
-        document.getElementById('uploadBtn').disabled = true;
-        selectedFile = null;
-        currentSessionId = '';
+        await handleApiResponse(response, 'Clear session');
+        const data = await response.json();
+        console.log('Session cleared:', data);
+        
+        // Reset all state
+        currentSessionId = null;
+        currentMatches = [];
+        currentNewFieldSuggestion = null;
+        currentFieldData = null;
         feedbackHistory = [];
+        batchSize = 5;
         
-        hideElement('uploadStatus');
-        showAlert('uploadStatus', 'Processing exited. You can start over with a new file.', 'info');
+        showAlert('uploadStatus', 'Session cleared successfully. You can now start a new session.', 'success');
+        
+    } catch (error) {
+        console.error('Error clearing session:', error);
+        // Still reset local state even if server call fails
+        currentSessionId = null;
+        currentMatches = [];
+        currentNewFieldSuggestion = null;
+        currentFieldData = null;
+        feedbackHistory = [];
+        batchSize = 5;
+        
+        showAlert('uploadStatus', 'Session cleared locally. You can start a new session.', 'info');
+    }
+}
+
+function exitProcessing() {
+    if (confirm('Are you sure you want to exit? This will clear your current session and you will lose any unsaved progress.')) {
+        // Clear the session on the server
+        clearSession().then(() => {
+            // Reset UI state
+            hideElement('currentFieldSection');
+            hideElement('sessionCompleted');
+            hideElement('loadingNextField');
+            hideElement('matchesSection');
+            hideElement('newFieldSection');
+            showElement('fileUploadSection');
+            
+            // Reset file input
+            const fileInput = document.getElementById('fileInput');
+            if (fileInput) {
+                fileInput.value = '';
+            }
+            selectedFile = null;
+            
+            // Clear any existing alerts
+            hideElement('uploadStatus');
+            
+            console.log('✅ Processing session ended and cleaned up');
+        });
     }
 }
 
@@ -728,22 +957,12 @@ async function checkSingleField() {
         console.log('API response status:', response.status);
         console.log('API response headers:', response.headers);
         
+        await handleApiResponse(response, 'Check single field');
         const result = await response.json();
         console.log('API response data:', result);
         
-        if (response.ok) {
-            showAlert('singleFieldStatus', 'Field check completed successfully!', 'success');
-            displaySingleFieldResults(result);
-        } else {
-            let errorMessage = result.detail || 'Failed to check field';
-            
-            if (response.status === 401) {
-                errorMessage = 'Authentication expired. Please re-authenticate.';
-            }
-            
-            console.error('API error response:', result);
-            showAlert('singleFieldStatus', errorMessage, 'error');
-        }
+        showAlert('singleFieldStatus', 'Field check completed successfully!', 'success');
+        displaySingleFieldResults(result);
     } catch (error) {
         console.error('Single field check error details:', error);
         console.error('Error type:', error.constructor.name);
@@ -825,7 +1044,6 @@ function displaySingleFieldMatches(matches) {
                 ${match.data_type ? `<strong>Data Type:</strong> ${match.data_type}<br>` : ''}
                 ${match.category ? `<strong>Category:</strong> ${match.category}<br>` : ''}
                 ${match.description ? `<strong>Description:</strong> ${match.description}<br>` : ''}
-                <strong>Reasoning:</strong> ${match.reasoning || 'No reasoning provided'}
             </div>
         `;
         matchesList.appendChild(matchDiv);
@@ -865,16 +1083,13 @@ async function improveSingleFieldMatches() {
             })
         });
         
+        await handleApiResponse(response, 'Improve single field matches');
         const result = await response.json();
         
-        if (response.ok) {
-            showAlert('singleFieldStatus', 'Matches improved with your feedback!', 'success');
-            displaySingleFieldMatches(result.matches);
-            // Clear feedback after applying
-            document.getElementById('matchFeedback').value = '';
-        } else {
-            showAlert('singleFieldStatus', result.detail || 'Failed to improve matches', 'error');
-        }
+        showAlert('singleFieldStatus', 'Matches improved with your feedback!', 'success');
+        displaySingleFieldMatches(result.matches);
+        // Clear feedback after applying
+        document.getElementById('matchFeedback').value = '';
     } catch (error) {
         console.error('Improve matches error:', error);
         showAlert('singleFieldStatus', 'Unable to improve matches. Please try again.', 'error');
@@ -903,15 +1118,16 @@ async function createSingleFieldNewField() {
             })
         });
         
+        await handleApiResponse(response, 'Create single field new field');
         const result = await response.json();
         
-        if (response.ok && result.new_field_suggestion) {
+        if (result.new_field_suggestion) {
             showAlert('singleFieldStatus', 'New field suggestion created!', 'success');
             displaySingleFieldNewField(result.new_field_suggestion);
             hideElement('singleFieldMatches');
             showElement('singleFieldNewField');
         } else {
-            showAlert('singleFieldStatus', result.detail || 'Failed to create new field suggestion', 'error');
+            showAlert('singleFieldStatus', 'Failed to create new field suggestion', 'error');
         }
     } catch (error) {
         console.error('Create new field error:', error);
@@ -972,15 +1188,16 @@ async function improveSingleFieldNewField() {
             })
         });
         
+        await handleApiResponse(response, 'Improve single field new field');
         const result = await response.json();
         
-        if (response.ok && result.new_field_suggestion) {
+        if (result.new_field_suggestion) {
             showAlert('singleFieldStatus', 'New field improved with your feedback!', 'success');
             displaySingleFieldNewField(result.new_field_suggestion);
             // Clear feedback after applying
             document.getElementById('newFieldFeedback').value = '';
         } else {
-            showAlert('singleFieldStatus', result.detail || 'Failed to improve new field', 'error');
+            showAlert('singleFieldStatus', 'Failed to improve new field', 'error');
         }
     } catch (error) {
         console.error('Improve new field error:', error);
@@ -990,7 +1207,7 @@ async function improveSingleFieldNewField() {
     showLoading('improveSingleFieldNewFieldIcon', false);
 }
 
-async function downloadSingleFieldNewField(format) {
+async function downloadSingleFieldNewField() {
     const fieldName = document.getElementById('fieldName').value.trim();
     const fieldDefinition = document.getElementById('fieldDefinition').value.trim();
     
@@ -1035,7 +1252,6 @@ async function downloadSingleFieldNewField(format) {
         formData.append('field_name', fieldName);
         formData.append('field_definition', fieldDefinition);
         formData.append('new_field_json', JSON.stringify(newFieldData));
-        formData.append('format', format);
         
         const response = await fetch('/cdd-agent/web/download-single-field-suggestion', {
             method: 'POST',
@@ -1045,60 +1261,64 @@ async function downloadSingleFieldNewField(format) {
             body: formData
         });
         
-        if (response.ok) {
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `new_field_suggestion_${fieldName.replace(/\s+/g, '_')}.${format}`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
-            
-            showAlert('singleFieldStatus', `New field suggestion downloaded as ${format.toUpperCase()}!`, 'success');
-        } else {
-            const result = await response.json();
-            showAlert('singleFieldStatus', result.detail || 'Failed to download new field suggestion', 'error');
-        }
+        await handleApiResponse(response, 'Download single field new field');
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `new_field_suggestion_${fieldName.replace(/\s+/g, '_')}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+        
+        showAlert('singleFieldStatus', 'New field suggestion downloaded as Excel!', 'success');
     } catch (error) {
         console.error('Download error:', error);
         showAlert('singleFieldStatus', 'Unable to download new field suggestion. Please try again.', 'error');
     }
 }
 
-async function downloadExampleFile(format) {
+async function downloadExampleFile() {
     try {
-        const response = await fetch(`/cdd-agent/web/example-file?format=${format}`, {
+        const response = await fetch('/cdd-agent/web/example-file', {
             headers: {
                 'Authorization': `Bearer ${authToken}`
             }
         });
         
-        if (response.ok) {
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `example_cdd_mapping.${format}`;
-            document.body.appendChild(a);
-            a.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(a);
-        } else {
-            const errorData = await response.json().catch(() => ({}));
-            let errorMessage = 'Failed to download example file';
-            
-            if (response.status === 401 || response.status === 403) {
-                errorMessage = 'Authentication expired. Please re-authenticate and try again.';
-                document.getElementById('mainInterface').classList.add('hidden');
-                authToken = null;
-            } else if (errorData.detail) {
-                errorMessage = errorData.detail;
+        await handleApiResponse(response, 'Download example file');
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        
+        // Try to get filename from Content-Disposition header
+        const contentDisposition = response.headers.get('Content-Disposition');
+        let filename = 'example_cdd_mapping.xlsx';
+        
+        if (contentDisposition) {
+            const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+            if (filenameMatch && filenameMatch[1]) {
+                filename = filenameMatch[1].replace(/['"]/g, '');
             }
-            
-            showAlert('singleFieldStatus', errorMessage, 'error');
         }
+        
+        // Ensure filename has .xlsx extension
+        if (!filename.toLowerCase().endsWith('.xlsx')) {
+            filename = filename.replace(/\.[^/.]+$/, '') + '.xlsx';
+        }
+        
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        
+        showAlert('singleFieldStatus', 'Example file downloaded successfully!', 'success');
+        
     } catch (error) {
         console.error('Download error:', error);
         showAlert('singleFieldStatus', 'Unable to download file. Please check your connection and try again.', 'error');
@@ -1211,23 +1431,18 @@ async function acceptNewField() {
             body: formData
         });
         
+        await handleApiResponse(response, 'Accept new field');
         const result = await response.json();
         
-        if (response.ok) {
-            console.log('Accept new field successful, moving to next field');
-            // Clear current suggestion for next field
-            currentNewFieldSuggestion = null;
-            
-            // Hide new field section
-            hideElement('newFieldSection');
-            
-            // Move to next field
-            await loadNextField();
-        } else {
-            console.error('Error accepting new field:', result);
-            showAlert('uploadStatus', 'Error accepting new field. Please try again.', 'error');
-            hideElement('loadingNextField');
-        }
+        console.log('Accept new field successful, moving to next field');
+        // Clear current suggestion for next field
+        currentNewFieldSuggestion = null;
+        
+        // Hide new field section
+        hideElement('newFieldSection');
+        
+        // Move to next field
+        await loadNextField();
     } catch (error) {
         console.error('Error accepting new field:', error);
         showAlert('uploadStatus', 'Unable to accept new field. Please check your connection.', 'error');
@@ -1268,24 +1483,19 @@ async function skipField() {
             body: formData
         });
         
+        await handleApiResponse(response, 'Skip field');
         const result = await response.json();
         
-        if (response.ok) {
-            console.log('Skip successful, moving to next field');
-            // Clear current suggestion for next field
-            currentNewFieldSuggestion = null;
-            
-            // Hide both sections
-            hideElement('matchesSection');
-            hideElement('newFieldSection');
-            
-            // Move to next field
-            await loadNextField();
-        } else {
-            console.error('Error skipping field:', result);
-            showAlert('uploadStatus', 'Error skipping field. Please try again.', 'error');
-            hideElement('loadingNextField');
-        }
+        console.log('Skip successful, moving to next field');
+        // Clear current suggestion for next field
+        currentNewFieldSuggestion = null;
+        
+        // Hide both sections
+        hideElement('matchesSection');
+        hideElement('newFieldSection');
+        
+        // Move to next field
+        await loadNextField();
     } catch (error) {
         console.error('Error skipping field:', error);
         showAlert('uploadStatus', 'Unable to skip field. Please check your connection.', 'error');
@@ -1294,4 +1504,13 @@ async function skipField() {
     
     isProcessingField = false;
     enableAllInteraction();
+}
+
+// Clear authentication token
+function clearToken() {
+    authToken = null;
+    localStorage.removeItem('cdd_auth_token');
+    document.getElementById('authToken').value = '';
+    document.getElementById('mainInterface').classList.add('hidden');
+    showAlert('authStatus', 'Authentication token cleared', 'success');
 } 

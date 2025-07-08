@@ -46,3 +46,22 @@ AI-powered agent for help find matching CDD fields or add new fields
 3. Fill in these credentials and submit
    - clientID
    - clientSecret
+
+## About
+
+This AI-powered application maps application fields to existing CDD (Common Data Dictionary) fields or creates new field suggestions.
+
+### How It Works
+
+**Bulk Processing:**
+1. Upload an Excel file with a "fields_to_map" tab containing: field_name, cdd_confirmed, context_definition, and cdd_best_guess columns
+2. The system processes each field by searching existing CDD database for matches
+3. Users can accept suggested matches or request new field creation
+4. New field suggestions are saved to a "new_suggested_fields" tab for wiki submission
+5. Download the updated file with all mappings and suggestions
+
+**Single Field Processing:**
+- Manually input a field name and context for individual field mapping
+
+**Feedback System:**
+- Provide feedback at any point to improve matching accuracy or new field suggestions

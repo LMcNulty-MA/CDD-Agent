@@ -1,6 +1,6 @@
 # CDD-AI-Agent Changelog/Release Notes
 
-### 2024-12-18 - Version 1.0.0
+### 2025-07-08
 -----------------------------------------
 #### What's New
  - Initial release of CDD Mapping Agent FastAPI application

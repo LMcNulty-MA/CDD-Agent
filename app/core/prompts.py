@@ -164,6 +164,54 @@ IMPORTANT: Do not remove acronym expansions or technical term definitions even i
 
 Return ONLY the shortened description with unnecessary words removed."""
 
+    # Bulk processing prompt for multiple fields at once
+    BULK_FIELD_MATCHING_PROMPT = """You are an expert in financial data mapping and CDD (Common Data Dictionary) field matching.
+
+Fields to Match ({field_count} fields):
+{fields_list}
+
+{context}
+
+{feedback_section}
+
+INSTRUCTIONS:
+1. Find the best matching CDD attributes for EACH field listed above
+2. Process all fields in a single response to optimize performance
+3. Consider semantic similarity between field names, display names, and descriptions
+4. Pay attention to data types - ensure compatibility (e.g., dates should match dates, strings with strings)
+5. Consider the business context and category - financial/ALM fields should match similar contexts
+6. Return up to {max_matches} best matches per field
+7. Include confidence scores (0.0 to 1.0) based on:
+   - Name/display name similarity (30%)
+   - Definition/description semantic match (50%) 
+   - Data type compatibility (10%)
+   - Category/business context fit (10%)
+8. Only include matches with confidence > 0.3
+9. Prioritize exact or near-exact semantic matches over partial matches
+
+Return JSON object with results for each field:
+{{
+    "field_1": [
+        {{
+            "cdd_field": "attributeName",
+            "confidence_score": 0.85,
+            "reasoning": "Brief explanation covering name, definition, data type, and context match"
+        }}
+    ],
+    "field_2": [
+        {{
+            "cdd_field": "attributeName",
+            "confidence_score": 0.75,
+            "reasoning": "Brief explanation covering name, definition, data type, and context match"
+        }}
+    ]
+}}
+
+IMPORTANT: 
+- Use the exact field names as keys in the JSON response
+- If no good matches found for a field, return empty array for that field
+- Ensure all {field_count} fields are included in the response"""
+
     # CLI-specific prompts with more detailed instructions
     CLI_FIELD_MATCHING_PROMPT = """You are an expert in financial data mapping and ALM (Asset Liability Management) systems.
 
@@ -265,7 +313,7 @@ class PromptBuilder:
             print(f"Error loading CDD guidelines: {e}")
             return "CDD guidelines not available"
     
-    def build_field_matching_prompt(self, field_name: str, field_definition: str, context: str, max_matches: int = 5, use_alm_format: bool = False, feedback_text: Optional[str] = None) -> str:
+    def build_field_matching_prompt(self, field_name: str, field_definition: str, context: str, max_matches: int = 3, use_alm_format: bool = False, feedback_text: Optional[str] = None) -> str:
         """Build a field matching prompt"""
         # Create feedback section
         feedback_section = ""
@@ -358,6 +406,32 @@ Please take this feedback into account when creating the new field suggestion an
             display_name=display_name or "Unknown"
         )
     
+    def build_bulk_field_matching_prompt(self, fields: List[Dict[str, str]], context: str, max_matches: int = 3, feedback_text: Optional[str] = None) -> str:
+        """Build a bulk field matching prompt for multiple fields"""
+        # Create feedback section
+        feedback_section = ""
+        if feedback_text:
+            feedback_section = f"""
+USER FEEDBACK FOR IMPROVEMENT:
+{feedback_text}
+
+Please take this feedback into account when finding matches and adjust your search criteria accordingly.
+"""
+        
+        # Format fields list
+        fields_list = ""
+        for i, field in enumerate(fields, 1):
+            fields_list += f"Field {i}: {field['field_name']}\n"
+            fields_list += f"  Definition: {field['field_definition']}\n\n"
+        
+        return PromptTemplates.BULK_FIELD_MATCHING_PROMPT.format(
+            field_count=len(fields),
+            fields_list=fields_list.strip(),
+            context=context,
+            max_matches=max_matches,
+            feedback_section=feedback_section
+        )
+    
     def get_system_message(self, role: str) -> str:
         """Get a system message for a specific AI role"""
         return PromptTemplates.SYSTEM_MESSAGES.get(role, "You are a helpful AI assistant.")
@@ -375,7 +449,7 @@ def get_prompt_builder() -> PromptBuilder:
 
 
 # Convenience functions for common prompt operations
-def build_field_matching_prompt(field_name: str, field_definition: str, context: str, max_matches: int = 5, use_alm_format: bool = False, feedback_text: Optional[str] = None) -> str:
+def build_field_matching_prompt(field_name: str, field_definition: str, context: str, max_matches: int = 3, use_alm_format: bool = False, feedback_text: Optional[str] = None) -> str:
     """Build a field matching prompt"""
     return get_prompt_builder().build_field_matching_prompt(field_name, field_definition, context, max_matches, use_alm_format, feedback_text)
 

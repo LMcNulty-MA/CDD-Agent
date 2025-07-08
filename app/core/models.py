@@ -196,6 +196,34 @@ class ExampleFileResponse(BaseModel):
     sample_data: List[Dict[str, str]]
     description: str
 
+# Bulk Processing Models for Web Interface
+class BulkFieldData(BaseModel):
+    field_name: str = Field(..., description="The field name")
+    field_definition: str = Field(..., description="The field definition/description")
+    index: int = Field(..., description="Index in the original file")
+
+class BulkFieldCheckRequest(BaseModel):
+    fields: List[BulkFieldData] = Field(..., description="List of fields to process in bulk (3-5 fields)")
+    session_id: str = Field(..., description="Session ID for tracking")
+    feedback_text: Optional[str] = Field(None, description="User feedback to improve matching")
+
+class BulkFieldResult(BaseModel):
+    field_name: str
+    field_definition: str
+    index: int
+    processable_index: int = Field(..., description="Position in the processable_indices array")
+    matches: List[CDDMatchResult] = Field(default_factory=list)
+    new_field_suggestion: Optional[NewCDDFieldSuggestion] = Field(None)
+    status: str = Field(..., description="Status: 'matched', 'new_suggestion', or 'no_match'")
+    confidence_threshold: float = Field(default=0.6)
+
+class BulkFieldCheckResponse(BaseModel):
+    session_id: str
+    results: List[BulkFieldResult] = Field(..., description="Results for each field")
+    total_processed: int = Field(..., description="Number of fields processed")
+    feedback_applied: bool = Field(False, description="Whether feedback was applied")
+    processing_time: float = Field(..., description="Processing time in seconds")
+
 # Description Compression Models
 class DescriptionCompressionRequest(BaseModel):
     compress_all: bool = Field(True, description="Compress all descriptions in database")
