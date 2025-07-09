@@ -23,10 +23,12 @@ from app.core.models import (
     StandardFieldHeaders, FileProcessingSession, FileUploadResponse,
     ProcessFieldRequest, ProcessFieldResponse, SessionStatusResponse,
     DownloadRequest, CDDMatchResult, NewCDDFieldSuggestion,
-    BulkFieldData, BulkFieldCheckRequest, BulkFieldCheckResponse, BulkFieldResult
+    BulkFieldData, BulkFieldCheckRequest, BulkFieldCheckResponse, BulkFieldResult,
+    TokenData
 )
 from app.core.services import cdd_mapping_service
 from app.core.auth_utils import token_dependency
+from app.core.security import oauth2_scheme
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,131 @@ router = APIRouter()
 
 # In-memory session storage (in production, use Redis or database)
 processing_sessions: Dict[str, Dict] = {}
+# User session mapping for recovery after token expiration
+user_sessions: Dict[str, List[str]] = {}  # user_id -> list of session_ids
+
+def get_user_id_from_token(token_data: TokenData) -> str:
+    """Extract user ID from JWT token payload"""
+    try:
+        # Try common JWT claims for user identification
+        payload = token_data.payload
+        user_id = (
+            payload.get('sub') or  # Subject (standard JWT claim)
+            payload.get('user_id') or
+            payload.get('username') or
+            payload.get('email') or
+            payload.get('preferred_username') or
+            str(payload.get('iat', ''))  # Issued at time as fallback
+        )
+        return str(user_id) if user_id else "anonymous"
+    except Exception:
+        logger.warning("Could not extract user ID from token, using anonymous")
+        return "anonymous"
+
+# Session Recovery Endpoint
+@router.get(
+    "/sessions/active",
+    summary="Get Active Sessions",
+    description="Get list of active sessions for the current user (for recovery after token expiration)",
+    status_code=status.HTTP_200_OK
+)
+async def get_active_sessions(token_data: TokenData = Depends(oauth2_scheme)):
+    """Get active sessions for the current user"""
+    try:
+        user_id = get_user_id_from_token(token_data)
+        
+        # Get sessions for this user
+        user_session_ids = user_sessions.get(user_id, [])
+        active_sessions = []
+        
+        for session_id in user_session_ids:
+            if session_id in processing_sessions:
+                session = processing_sessions[session_id]
+                # Only include sessions that are still active or recently completed
+                if session['status'] in ['active', 'completed']:
+                    active_sessions.append({
+                        'session_id': session_id,
+                        'original_filename': session['original_filename'],
+                        'status': session['status'],
+                        'created_at': session['created_at'].isoformat(),
+                        'last_updated': session['last_updated'].isoformat(),
+                        'progress': {
+                            'total_fields': session['total_fields'],
+                            'processable_fields': session['processable_fields'],
+                            'processed_fields': session['processed_fields'],
+                            'remaining_fields': session['processable_fields'] - session['processed_fields']
+                        }
+                    })
+        
+        return {
+            'user_id': user_id,
+            'active_sessions': active_sessions,
+            'total_sessions': len(active_sessions)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error retrieving active sessions: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to retrieve active sessions: {str(e)}"
+        )
+
+# Session Recovery Endpoint
+@router.post(
+    "/sessions/{session_id}/recover",
+    summary="Recover Session",
+    description="Recover an existing session after token expiration",
+    status_code=status.HTTP_200_OK
+)
+async def recover_session(session_id: str, token_data: TokenData = Depends(oauth2_scheme)):
+    """Recover an existing session after token expiration"""
+    try:
+        user_id = get_user_id_from_token(token_data)
+        
+        # Check if session exists
+        if session_id not in processing_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+        
+        session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
+        
+        # Update session activity
+        session['last_updated'] = datetime.now()
+        
+        # Return session info
+        return {
+            'session_id': session_id,
+            'status': 'recovered',
+            'original_filename': session['original_filename'],
+            'session_status': session['status'],
+            'progress': {
+                'total_fields': session['total_fields'],
+                'processable_fields': session['processable_fields'],
+                'processed_fields': session['processed_fields'],
+                'current_index': session['current_index'],
+                'remaining_fields': session['processable_fields'] - session['processed_fields']
+            },
+            'can_download': session['processed_fields'] > 0,
+            'message': 'Session recovered successfully'
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error recovering session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unable to recover session: {str(e)}"
+        )
 
 # Single Field Check Endpoint
 @router.post(
@@ -43,18 +170,12 @@ processing_sessions: Dict[str, Dict] = {}
     response_model=SingleFieldCheckResponse,
     status_code=status.HTTP_200_OK
 )
-async def check_single_field(request: SingleFieldCheckRequest, token: str = Depends(token_dependency)):
+async def check_single_field(request: SingleFieldCheckRequest, token_data: TokenData = Depends(oauth2_scheme)):
     """Check a single field against CDD attributes"""
     try:
         logger.info(f"Checking field: {request.field_name} with action: {request.action_type}")
         
-        # Validate token is present (oauth2_scheme should handle this, but double-check)
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required. Please provide a valid Bearer token in the Authorization header.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # User validation is handled by oauth2_scheme dependency
         
         # Use the service to check the field
         result = cdd_mapping_service.check_single_field(
@@ -84,16 +205,10 @@ async def check_single_field(request: SingleFieldCheckRequest, token: str = Depe
     description="Download an example Excel file with both tabs showing the required format",
     status_code=status.HTTP_200_OK
 )
-async def get_example_file(token: str = Depends(token_dependency)):
+async def get_example_file(token_data: TokenData = Depends(oauth2_scheme)):
     """Get an example Excel file with both tabs showing the required format"""
     try:
-        # Validate token is present
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required. Please provide a valid Bearer token in the Authorization header.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # User validation is handled by oauth2_scheme dependency
         
         # Create example data for fields_to_map tab
         fields_to_map_data = [
@@ -185,17 +300,12 @@ async def get_example_file(token: str = Depends(token_dependency)):
 )
 async def upload_file(
     file: UploadFile = File(...),
-    token: str = Depends(token_dependency)
+    token_data: TokenData = Depends(oauth2_scheme)
 ):
     """Upload and process a file for CDD mapping"""
     try:
-        # Validate token
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # Get user ID from token
+        user_id = get_user_id_from_token(token_data)
         
         # Validate file type
         if not file.filename or not file.filename.lower().endswith('.xlsx'):
@@ -282,9 +392,10 @@ async def upload_file(
         # Create session
         session_id = str(uuid.uuid4())
         
-        # Store session data with original filename
+        # Store session data with user identification
         processing_sessions[session_id] = {
             'session_id': session_id,
+            'user_id': user_id,  # Add user identification
             'original_filename': file.filename,
             'original_df': df.to_dict('records'),
             'processable_indices': processable_df.index.tolist(),
@@ -300,6 +411,11 @@ async def upload_file(
             'current_bulk_batch': None,  # Current batch being processed
             'bulk_batch_size': settings.BULK_FIELD_BATCH_SIZE  # Configurable batch size
         }
+        
+        # Track user sessions for recovery
+        if user_id not in user_sessions:
+            user_sessions[user_id] = []
+        user_sessions[user_id].append(session_id)
         
         return FileUploadResponse(
             session_id=session_id,
@@ -329,16 +445,11 @@ async def upload_file(
 async def bulk_process_fields(
     session_id: str,
     feedback_text: Optional[str] = Form(None),
-    token: str = Depends(token_dependency)
+    token_data: TokenData = Depends(oauth2_scheme)
 ):
     """Process multiple fields in bulk for better performance"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id not in processing_sessions:
             raise HTTPException(
@@ -347,6 +458,14 @@ async def bulk_process_fields(
             )
         
         session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
+        
         batch_size = session['bulk_batch_size']
         
         # Get the next batch of fields to process
@@ -462,15 +581,10 @@ async def bulk_process_fields(
     description="Get the next field in the session for processing",
     status_code=status.HTTP_200_OK
 )
-async def get_next_field(session_id: str, token: str = Depends(token_dependency)):
+async def get_next_field(session_id: str, token_data: TokenData = Depends(oauth2_scheme)):
     """Get the next field to process in the session"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id not in processing_sessions:
             raise HTTPException(
@@ -479,6 +593,13 @@ async def get_next_field(session_id: str, token: str = Depends(token_dependency)
             )
         
         session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
         
         # Check if all fields are processed
         if session['current_index'] >= len(session['processable_indices']):
@@ -580,16 +701,11 @@ async def process_field_action(
     selected_match: Optional[str] = Form(None),
     new_field_json: Optional[str] = Form(None),
     feedback_history: Optional[str] = Form(None),
-    token: str = Depends(token_dependency)
+    token_data: TokenData = Depends(oauth2_scheme)
 ):
     """Process a field action in the session"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id not in processing_sessions:
             raise HTTPException(
@@ -598,6 +714,13 @@ async def process_field_action(
             )
         
         session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
         
         if session['current_index'] >= len(session['processable_indices']):
             raise HTTPException(
@@ -703,16 +826,11 @@ async def process_field_action(
 )
 async def download_files(
     session_id: str,
-    token: str = Depends(token_dependency)
+    token_data: TokenData = Depends(oauth2_scheme)
 ):
     """Download the complete Excel file with updated mappings and new field suggestions"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id not in processing_sessions:
             raise HTTPException(
@@ -721,6 +839,13 @@ async def download_files(
             )
         
         session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
         
         # Create updated fields_to_map data
         fields_to_map_df = pd.DataFrame(session['original_df'])
@@ -808,16 +933,11 @@ async def download_single_field_suggestion(
     field_name: str = Form(...),
     field_definition: str = Form(...),
     new_field_json: str = Form(...),
-    token: str = Depends(token_dependency)
+    token_data: TokenData = Depends(oauth2_scheme)
 ):
     """Download a single field's new field suggestion as Excel file"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        # User validation is handled by oauth2_scheme dependency
         
         # Parse the new field data
         try:
@@ -889,19 +1009,28 @@ async def download_single_field_suggestion(
     description="Clear the session and clean the slate - user can exit at any time",
     status_code=status.HTTP_200_OK
 )
-async def clear_session(session_id: str, token: str = Depends(token_dependency)):
+async def clear_session(session_id: str, token_data: TokenData = Depends(oauth2_scheme)):
     """Clear the session and clean the slate"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id in processing_sessions:
+            session = processing_sessions[session_id]
+            
+            # Check if session belongs to this user
+            if session.get('user_id') != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Session does not belong to current user"
+                )
+            
             # Clean up the session
             del processing_sessions[session_id]
+            
+            # Remove from user sessions tracking
+            if user_id in user_sessions:
+                user_sessions[user_id] = [s for s in user_sessions[user_id] if s != session_id]
+            
             logger.info(f"Session {session_id} cleared successfully")
             
             return {
@@ -930,15 +1059,10 @@ async def clear_session(session_id: str, token: str = Depends(token_dependency))
     description="Get the current status of the processing session",
     status_code=status.HTTP_200_OK
 )
-async def get_session_status(session_id: str, token: str = Depends(token_dependency)):
+async def get_session_status(session_id: str, token_data: TokenData = Depends(oauth2_scheme)):
     """Get the current status of the processing session"""
     try:
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication token is required.",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
+        user_id = get_user_id_from_token(token_data)
         
         if session_id not in processing_sessions:
             raise HTTPException(
@@ -947,6 +1071,13 @@ async def get_session_status(session_id: str, token: str = Depends(token_depende
             )
         
         session = processing_sessions[session_id]
+        
+        # Check if session belongs to this user
+        if session.get('user_id') != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Session does not belong to current user"
+            )
         batch_size = session['bulk_batch_size']
         
         # Calculate current batch info

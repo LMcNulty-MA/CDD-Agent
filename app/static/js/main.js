@@ -10,12 +10,18 @@ let isProcessingField = false;  // Prevent rapid field processing
 let lastProcessTime = 0;        // Track timing for rate limiting
 let currentFieldData = null;    // Store current field data for processing
 let batchSize = 5;              // Batch size for bulk processing (updated from server)
+let sessionToRecover = null;    // In-memory session recovery (only for token expiration, cleared on page refresh/close)
 
 // Global error handler for API responses
 async function handleApiResponse(response, operation = 'API call') {
     if (response.status === 401) {
         // Token expired or invalid
-        console.log('Token expired, clearing authentication');
+        console.log('Token expired, attempting session recovery');
+        
+        // Store current session for recovery (in-memory only, clears on page refresh)
+        sessionToRecover = currentSessionId;
+        
+        // Clear auth state
         authToken = null;
         localStorage.removeItem('cdd_auth_token');
         
@@ -23,14 +29,15 @@ async function handleApiResponse(response, operation = 'API call') {
         document.getElementById('mainInterface').classList.add('hidden');
         document.getElementById('authToken').value = '';
         
-        // Show user-friendly message
-        showAlert('authStatus', 'Your session has expired. Please enter your authentication token again.', 'error');
+        // Show user-friendly message with session recovery info
+        let message = 'Your session has expired. Please enter your authentication token again.';
+        if (sessionToRecover) {
+            message += ' Your processing session will be recovered automatically.';
+        }
+        showAlert('authStatus', message, 'error');
         
-        // Clear any ongoing sessions
+        // Clear current session reference but don't reset processing state yet
         currentSessionId = null;
-        
-        // Reset processing state
-        lastBulkProcessedIndex = -1;
         
         throw new Error('Authentication expired');
     }
@@ -52,6 +59,9 @@ async function handleApiResponse(response, operation = 'API call') {
 
 // Initialize page on load
 document.addEventListener('DOMContentLoaded', function() {
+    // Clear any in-memory session recovery data (resets on page refresh/reload)
+    sessionToRecover = null;
+    
     // Load saved token from localStorage
     const savedToken = localStorage.getItem('cdd_auth_token');
     if (savedToken) {
@@ -205,6 +215,12 @@ async function authenticateUser() {
         showAlert('authStatus', 'Authentication successful! 🎉', 'success');
         document.getElementById('mainInterface').classList.remove('hidden');
         
+        // Check for session recovery
+        await attemptSessionRecovery();
+        
+        // Show active sessions to user
+        await showActiveSessions();
+        
     } catch (error) {
         console.error('Authentication error:', error);
         // Clear saved token on error
@@ -218,6 +234,193 @@ async function authenticateUser() {
     }
     
     showLoading('authLoadingIcon', false);
+}
+
+// Session recovery functions
+async function attemptSessionRecovery() {
+    if (!sessionToRecover) {
+        console.log('No session to recover');
+        return;
+    }
+    
+    console.log('🔄 Attempting to recover session:', sessionToRecover);
+    
+    try {
+        // First, get active sessions to verify this session still exists
+        const activeSessionsResponse = await fetch('/cdd-agent/web/sessions/active', {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        
+        await handleApiResponse(activeSessionsResponse, 'Get active sessions');
+        const activeSessions = await activeSessionsResponse.json();
+        
+        // Check if our session is in the active sessions
+        const targetSession = activeSessions.active_sessions.find(s => s.session_id === sessionToRecover);
+        
+        if (!targetSession) {
+            console.log('❌ Session not found in active sessions');
+            sessionToRecover = null; // Clear the in-memory variable
+            return;
+        }
+        
+        // Recover the session
+        const recoverResponse = await fetch(`/cdd-agent/web/sessions/${sessionToRecover}/recover`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        
+        await handleApiResponse(recoverResponse, 'Session recovery');
+        const recoveryResult = await recoverResponse.json();
+        
+        // Set the current session and update UI
+        currentSessionId = sessionToRecover;
+        sessionToRecover = null; // Clear the recovery variable since we've recovered
+        
+        console.log('✅ Session recovered successfully:', recoveryResult);
+        showAlert('authStatus', `Session recovered: ${recoveryResult.original_filename}`, 'success');
+        
+        // Update UI to show the recovered session
+        hideElement('fileUploadSection');
+        showElement('processingInterface');
+        
+        // Load the current field
+        await loadNextField();
+        
+    } catch (error) {
+        console.error('Session recovery failed:', error);
+        sessionToRecover = null; // Clear the in-memory variable
+        showAlert('authStatus', 'Session recovery failed. Please upload your file again.', 'warning');
+    }
+}
+
+async function getActiveSessions() {
+    try {
+        const response = await fetch('/cdd-agent/web/sessions/active', {
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        
+        await handleApiResponse(response, 'Get active sessions');
+        const result = await response.json();
+        
+        return result.active_sessions;
+    } catch (error) {
+        console.error('Failed to get active sessions:', error);
+        return [];
+    }
+}
+
+async function showActiveSessions() {
+    try {
+        const activeSessions = await getActiveSessions();
+        
+        if (activeSessions.length === 0) {
+            console.log('No active sessions found');
+            return;
+        }
+        
+        // Create UI to show active sessions
+        const sessionsContainer = document.getElementById('activeSessions');
+        if (!sessionsContainer) {
+            console.warn('Active sessions container not found in UI');
+            return;
+        }
+        
+        // Clear existing content
+        sessionsContainer.innerHTML = '';
+        
+        // Create sessions list
+        const sessionsList = document.createElement('div');
+        sessionsList.className = 'active-sessions-list';
+        
+        const header = document.createElement('h3');
+        header.textContent = 'Active Sessions';
+        sessionsList.appendChild(header);
+        
+        activeSessions.forEach(session => {
+            const sessionCard = document.createElement('div');
+            sessionCard.className = 'session-card';
+            
+            const sessionInfo = document.createElement('div');
+            sessionInfo.className = 'session-info';
+            
+            const filename = document.createElement('div');
+            filename.className = 'session-filename';
+            filename.textContent = session.original_filename;
+            
+            const status = document.createElement('div');
+            status.className = `session-status status-${session.status}`;
+            status.textContent = session.status.charAt(0).toUpperCase() + session.status.slice(1);
+            
+            const progress = document.createElement('div');
+            progress.className = 'session-progress';
+            progress.textContent = `${session.progress.processed_fields}/${session.progress.processable_fields} fields processed`;
+            
+            const lastUpdated = document.createElement('div');
+            lastUpdated.className = 'session-last-updated';
+            lastUpdated.textContent = `Last updated: ${new Date(session.last_updated).toLocaleString()}`;
+            
+            sessionInfo.appendChild(filename);
+            sessionInfo.appendChild(status);
+            sessionInfo.appendChild(progress);
+            sessionInfo.appendChild(lastUpdated);
+            
+            const recoverButton = document.createElement('button');
+            recoverButton.className = 'recover-session-btn';
+            recoverButton.textContent = 'Recover Session';
+            recoverButton.onclick = () => recoverExistingSession(session.session_id);
+            
+            sessionCard.appendChild(sessionInfo);
+            sessionCard.appendChild(recoverButton);
+            
+            sessionsList.appendChild(sessionCard);
+        });
+        
+        sessionsContainer.appendChild(sessionsList);
+        showElement('activeSessions');
+        
+    } catch (error) {
+        console.error('Failed to show active sessions:', error);
+    }
+}
+
+async function recoverExistingSession(sessionId) {
+    try {
+        console.log('🔄 Manually recovering session:', sessionId);
+        
+        const response = await fetch(`/cdd-agent/web/sessions/${sessionId}/recover`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${authToken}`
+            }
+        });
+        
+        await handleApiResponse(response, 'Manual session recovery');
+        const result = await response.json();
+        
+        // Set the current session and update UI
+        currentSessionId = sessionId;
+        
+        console.log('✅ Session recovered manually:', result);
+        showAlert('authStatus', `Session recovered: ${result.original_filename}`, 'success');
+        
+        // Hide active sessions and show processing interface
+        hideElement('activeSessions');
+        hideElement('fileUploadSection');
+        showElement('processingInterface');
+        
+        // Load the current field
+        await loadNextField();
+        
+    } catch (error) {
+        console.error('Manual session recovery failed:', error);
+        showAlert('authStatus', 'Failed to recover session. Please try again.', 'error');
+    }
 }
 
 // File handling
@@ -421,14 +624,14 @@ async function loadNextField() {
         console.log('📥 Next field response:', data);
         
         if (data.status === 'completed') {
-            // Session completed - ensure progress shows full completion
+            // Session completed - use actual backend progress data
             console.log('🎉 Session completed, showing results');
             console.log('Completion progress data:', data.progress);
             
-            // Force completion progress to show x/x regardless of backend numbers
-            if (data.progress && data.progress.total) {
-                console.log('Setting completion progress to:', data.progress.total, '/', data.progress.total);
-                updateProgressBar(data.progress.total, data.progress.total);
+            // Use the backend's actual progress data instead of forcing it
+            if (data.progress) {
+                console.log('Setting completion progress to:', data.progress.processed, '/', data.progress.total);
+                updateProgressBar(data.progress.total, data.progress.processed);
             }
             
             showElement('sessionCompleted');
@@ -444,14 +647,14 @@ async function loadNextField() {
         if (data.progress) {
             updateProgressBar(data.progress.total, data.progress.processed);
             
-            // Additional check: if processed equals total, we're done
-            if (data.progress.processed >= data.progress.total && data.progress.total > 0) {
-                console.log('🎯 Detected completion based on progress numbers:', data.progress.processed, '>=', data.progress.total);
-                updateProgressBar(data.progress.total, data.progress.total);
-                showElement('sessionCompleted');
-                hideElement('currentFieldSection');
-                return;
-            }
+                    // Additional check: if processed equals total, we're done
+        if (data.progress.processed >= data.progress.total && data.progress.total > 0) {
+            console.log('🎯 Detected completion based on progress numbers:', data.progress.processed, '>=', data.progress.total);
+            updateProgressBar(data.progress.total, data.progress.processed);
+            showElement('sessionCompleted');
+            hideElement('currentFieldSection');
+            return;
+        }
         }
         
         // Update batch size from server response
