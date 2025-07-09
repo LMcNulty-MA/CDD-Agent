@@ -22,7 +22,7 @@ def check_dependencies():
     try:
         import fastapi
         import uvicorn
-        import openai
+        import langchain_openai
         import pymongo
         print("✓ All required dependencies are installed")
         return True
@@ -33,7 +33,7 @@ def check_dependencies():
 
 def check_environment():
     """Check if required environment variables are set"""
-    required_vars = ['OPENAI_API_KEY', 'DOCDB_URI']
+    required_vars = ['AZURE_OPENAI_API_KEY', 'DOCDB_URI']
     missing_vars = []
     
     for var in required_vars:
@@ -59,7 +59,7 @@ def check_database_connection():
         from app.core.documentdb import MongoDBClient
         from app.config import settings
         
-        print(f"Testing connection to: {settings.DOCDB_URI}")
+        print(f"Testing connection to MongoDB")
         print(f"Database name: {settings.DOCDB_DATABASE_NAME}")
         
         # Use our existing MongoDBClient class

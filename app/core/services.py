@@ -13,12 +13,6 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 
-try:
-    import openai
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
-
 from app.config import settings
 from app.core.documentdb import MongoDBClient
 from app.core.models import (
@@ -27,13 +21,16 @@ from app.core.models import (
 )
 from app.core.utils import save_prompt_and_response, ProcessLogger
 from app.core.prompts import get_prompt_builder, get_system_message
+from app.core.azure_openai import ChatOpenAI
 
-# Set up OpenAI client if available
-if HAS_OPENAI:
-    openai.api_key = settings.OPENAI_API_KEY
-    client = openai.OpenAI()
-else:
+# Set up Azure OpenAI client
+try:
+    client = ChatOpenAI(model=settings.MODEL_TO_USE, temperature=0)
+    HAS_AZURE_OPENAI = True
+except Exception as e:
+    print(f"Warning: Azure OpenAI client initialization failed: {e}")
     client = None
+    HAS_AZURE_OPENAI = False
 
 class CDDMappingService:
     """Core service for CDD field mapping operations"""
@@ -73,9 +70,9 @@ class CDDMappingService:
             return [], []
 
     def find_best_cdd_matches(self, field_name: str, field_definition: str, cdd_attributes: List[Dict], max_matches: int = 5, feedback_text: Optional[str] = None) -> List[Dict]:
-        """Find best CDD matches for a field using GPT-4 with optional feedback"""
-        if not HAS_OPENAI or not client:
-            print("OpenAI not available, returning empty matches")
+        """Find best CDD matches for a field using Azure OpenAI with optional feedback"""
+        if not HAS_AZURE_OPENAI or not client:
+            print("Azure OpenAI not available, returning empty matches")
             return []
         
         # First, check if the field definition has sufficient context
@@ -104,23 +101,12 @@ class CDDMappingService:
         )
         
         try:
-            # Prepare API call parameters
-            api_params = {
-                "model": settings.MODEL_TO_USE,
-                "messages": [
-                    {"role": "system", "content": get_system_message("field_matching_expert")},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 1000,
-            }
+            response = client.invoke([
+                {"role": "system", "content": get_system_message("field_matching_expert")},
+                {"role": "user", "content": prompt}
+            ])
             
-            # Only add temperature for models that support it
-            if settings.MODEL_TO_USE not in ["gpt-4o-mini", "o1-mini", "o1-preview"]:
-                api_params["temperature"] = 0.1
-            
-            response = client.chat.completions.create(**api_params)
-            
-            result = response.choices[0].message.content.strip()
+            result = response.content.strip()
             
             # Save prompt and response for debugging (like CLI tool) - only if enabled
             if settings.SAVE_PROMPTS_TO_FILE:
@@ -159,8 +145,8 @@ class CDDMappingService:
 
     def create_new_cdd_field_suggestion(self, field_name: str, field_definition: str, categories: List[Dict], attributes: List[Dict], tag: Optional[str] = None, feedback_text: Optional[str] = None) -> Optional[Dict]:
         """Create a new CDD field suggestion using GPT-4 with optional feedback"""
-        if not HAS_OPENAI or not client:
-            print("OpenAI not available, returning no suggestion")
+        if not HAS_AZURE_OPENAI or not client:
+            print("Azure OpenAI not available, returning no suggestion")
             return None
             
         if tag is None:
@@ -183,17 +169,12 @@ class CDDMappingService:
         )
         
         try:
-            response = client.chat.completions.create(
-                model=settings.MODEL_TO_USE,
-                messages=[
-                    {"role": "system", "content": get_system_message("cdd_design_expert")},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=500,
-                temperature=0.1
-            )
+            response = client.invoke([
+                {"role": "system", "content": get_system_message("cdd_design_expert")},
+                {"role": "user", "content": prompt}
+            ])
             
-            result = response.choices[0].message.content.strip()
+            result = response.content.strip()
             
             # Save prompt and response for debugging (like CLI tool) - only if enabled
             if settings.SAVE_PROMPTS_TO_FILE:
@@ -397,7 +378,7 @@ class CDDMappingService:
             if match_results and match_results[0].confidence_score >= 0.6:
                 status = "matched"
                 
-        elif action_type == "create_new_field":
+        elif action_type in ["create_new_field", "improve_new_field"]:
             # Create new field suggestion with optional feedback
             new_field_data = self.create_new_cdd_field_suggestion(
                 field_name, 
@@ -441,8 +422,8 @@ class CDDMappingService:
 
     def check_bulk_fields(self, fields: List[Dict[str, str]], feedback_text: Optional[str] = None) -> Dict[str, List[Dict]]:
         """Check multiple fields at once using bulk processing for improved performance"""
-        if not HAS_OPENAI or not client:
-            print("OpenAI not available, returning empty results")
+        if not HAS_AZURE_OPENAI or not client:
+            print("Azure OpenAI not available, returning empty results")
             return {}
         
         if not fields:
@@ -492,23 +473,12 @@ class CDDMappingService:
         )
         
         try:
-            # Prepare API call parameters
-            api_params = {
-                "model": settings.MODEL_TO_USE,
-                "messages": [
-                    {"role": "system", "content": get_system_message("field_matching_expert")},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 2000,  # Increased for bulk processing
-            }
+            response = client.invoke([
+                {"role": "system", "content": get_system_message("field_matching_expert")},
+                {"role": "user", "content": prompt}
+            ])
             
-            # Only add temperature for models that support it
-            if settings.MODEL_TO_USE not in ["gpt-4o-mini", "o1-mini", "o1-preview"]:
-                api_params["temperature"] = 0.1
-            
-            response = client.chat.completions.create(**api_params)
-            
-            result = response.choices[0].message.content.strip()
+            result = response.content.strip()
             
             # Save prompt and response for debugging
             if settings.SAVE_PROMPTS_TO_FILE:
@@ -556,8 +526,8 @@ class CDDMappingService:
 
     def compress_attribute_description(self, description: str, field_name: str = "", data_type: str = "", display_name: str = "", max_tokens: Optional[int] = None) -> str:
         """Compress a single attribute description using AI while preserving key information"""
-        if not HAS_OPENAI or not client:
-            print("OpenAI not available, returning original description")
+        if not HAS_AZURE_OPENAI or not client:
+            print("Azure OpenAI not available, returning original description")
             return description
         
         word_count = len(description.split())
@@ -579,7 +549,7 @@ class CDDMappingService:
             # Log the request details
             request_logger = ProcessLogger("compression_api_requests.log", auto_clear=False)
             request_logger.info("Sending compression request", context={
-                "model": settings.COMPRESSION_MODEL,
+                "model": settings.MODEL_TO_USE,
                 "field_name": field_name or "Unknown",
                 "data_type": data_type or "Unknown", 
                 "display_name": display_name or "Unknown",
@@ -587,16 +557,15 @@ class CDDMappingService:
                 "input_preview": description[:150] + "..."
             })
             
-            response = client.chat.completions.create(
-                model=settings.COMPRESSION_MODEL,
-                messages=[
-                    {"role": "system", "content": get_system_message("description_compression_expert")},
-                    {"role": "user", "content": compression_prompt}
-                ]
-            )
+            # Create a separate client for compression with different model/temperature
+            compression_client = ChatOpenAI(model=settings.MODEL_TO_USE, temperature=0)
+            response = compression_client.invoke([
+                {"role": "system", "content": get_system_message("description_compression_expert")},
+                {"role": "user", "content": compression_prompt}
+            ])
             
             # Log the raw response
-            raw_content = response.choices[0].message.content
+            raw_content = response.content
             request_logger.info("Received API response", context={
                 "raw_response": raw_content,
                 "response_type": type(raw_content).__name__,
@@ -642,7 +611,7 @@ class CDDMappingService:
                     "error": str(e),
                     "exception_type": type(e).__name__,
                     "original_word_count": word_count,
-                    "model": settings.COMPRESSION_MODEL,
+                    "model": settings.MODEL_TO_USE,
                     "description_length_chars": len(description),
                     "description_preview": description[:150] + "..." if len(description) > 150 else description
                 })
@@ -662,7 +631,7 @@ class CDDMappingService:
         logger.info("Process configuration", context={
             "batch_size": batch_size, 
             "dry_run": dry_run, 
-            "model": settings.COMPRESSION_MODEL
+            "model": settings.MODEL_TO_USE
         })
         
         try:

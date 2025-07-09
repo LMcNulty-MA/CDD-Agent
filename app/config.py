@@ -6,40 +6,46 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings(BaseSettings):
-    # OpenAI
-    OPENAI_API_KEY: str = ""
+    # Azure OpenAI (replaces OpenAI)
     MODEL_TO_USE: str = "gpt-4.1"
-    
+
     # MongoDB
     DOCDB_URI: str = ""
     DOCDB_DATABASE_NAME: str = "cdd-agent"
-    
-    # SSO Settings
-    GLOBAL_SSO_SERVICE_URL: str = ""
-    
-    # File paths for CDD mapping
-    FIELD_NEED_MAPPING_FILE: str = r"C:\Users\McNultyL\OneDrive - moodys.com\Documents\GitHub\ai-field-mapping\ZM Engine Fields.csv"
-    NEW_CDD_FIELD_REQUEST_FILE: str = r"C:\Users\McNultyL\OneDrive - moodys.com\Documents\GitHub\ai-field-mapping\ZM_New_CDD_Field_Requests.csv"
-    
-    # Prompt debugging
-    SAVE_PROMPTS_TO_FILE: bool = True
-    
-    # Performance optimization
-    MAX_ATTRIBUTES_FOR_MATCHING: int = 50  # Reduce prompt size for better performance
-    
-    # Bulk processing settings
-    BULK_FIELD_BATCH_SIZE: int = 5  # Number of fields to process in bulk (3-5 recommended)
-    
-    # Description compression settings
-    COMPRESSION_MODEL: str = "o4-mini"  # Small, fast model for compression
-    MAX_DESCRIPTION_TOKENS: int = 40        # Target compression size
-    COMPRESSION_BATCH_SIZE: int = 10        # Process N descriptions at once
-    
-    # Output formatting
-    DEFAULT_LABEL_TAG: str = "ZM/OALM"
-    
+
+    # Environment
+    GLOBAL_ENV: str = ""
+    GLOBAL_ENV_CODE: str = ""
+
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # SSO Settings
+    GLOBAL_SSO_SERVICE_URL: str = ""
+    SSO_SERVICE_ID: str = ""
+    SSO_SERVICE_SECRET: str = ""
+
+    # Azure Deployment API Related
+    GLOBAL_DOCDB_SERVICE_URL: str = ""
+    DOCUMENTDB_CONFIG_COLLECTION: str = ""
+    AZURE_DEPLOYMENT_API: str = ""
+    AZURE_OPENAI_API_KEY: str = ""
+
+    # Prompt debugging
+    SAVE_PROMPTS_TO_FILE: bool = True
+
+    # Performance optimization
+    MAX_ATTRIBUTES_FOR_MATCHING: int = 50  # Reduce prompt size for better performance
+
+    # Bulk processing settings
+    BULK_FIELD_BATCH_SIZE: int = 5  # Number of fields to process in bulk (3-5 recommended)
+
+    # Description compression settings
+    MAX_DESCRIPTION_TOKENS: int = 40        # Target compression size
+    COMPRESSION_BATCH_SIZE: int = 10        # Process N descriptions at once
+
+    # Output formatting
+    DEFAULT_LABEL_TAG: str = ""
 
     class Config:
         env_file = ".env"

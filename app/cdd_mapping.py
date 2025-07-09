@@ -3,7 +3,6 @@ import json
 import os
 import sys
 from typing import List, Dict, Optional, Tuple
-import openai
 import keyboard
 import time
 import random
@@ -25,9 +24,9 @@ from app.core.documentdb import MongoDBClient  # Using sync client for CLI
 from app.core.models import StandardFieldHeaders
 from app.core.utils import save_prompt_and_response
 from app.core.prompts import get_prompt_builder, get_system_message
+from app.core.azure_openai import ChatOpenAI
 
 # Configuration
-OPENAI_API_KEY = settings.OPENAI_API_KEY
 MODEL = settings.MODEL_TO_USE
 DOCDB_URI = settings.DOCDB_URI
 DOCDB_DATABASE_NAME = settings.DOCDB_DATABASE_NAME
@@ -46,9 +45,13 @@ OUTPUT_FORMAT = "json" if OUTPUT_FILE_PATH.lower().endswith('.json') else "csv"
 print(f"{WHITE}Input Format: {INPUT_FORMAT}, Output Format: {OUTPUT_FORMAT}{RESET}")
 print(f"{WHITE}Prompt Saving: {'Enabled' if settings.SAVE_PROMPTS_TO_FILE else 'Disabled'}{RESET}")
 
-# Set up OpenAI client
-openai.api_key = OPENAI_API_KEY
-client = openai.OpenAI()
+# Set up Azure OpenAI client
+try:
+    client = ChatOpenAI(model=MODEL, temperature=0)
+    print(f"{WHITE}Azure OpenAI client initialized successfully{RESET}")
+except Exception as e:
+    print(f"{RED}Failed to initialize Azure OpenAI client: {e}{RESET}")
+    sys.exit(1)
 
 # Initialize MongoDB client
 db_client = MongoDBClient(DOCDB_URI, DOCDB_DATABASE_NAME)
@@ -308,17 +311,12 @@ def find_best_cdd_matches(field_name: str, field_definition: str, attributes: Li
     )
     
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": get_system_message("financial_data_expert")},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=400,
-            temperature=0.1
-        )
+        response = client.invoke([
+            {"role": "system", "content": get_system_message("financial_data_expert")},
+            {"role": "user", "content": prompt}
+        ])
         
-        result = response.choices[0].message.content.strip()
+        result = response.content.strip()
         matches = json.loads(result)
         
         # Save prompt and response to fixed file
@@ -422,17 +420,12 @@ def create_new_cdd_field_suggestion(field_name: str, field_definition: str, cate
     )
     
     try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": get_system_message("cdd_design_expert")},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.1
-        )
+        response = client.invoke([
+            {"role": "system", "content": get_system_message("cdd_design_expert")},
+            {"role": "user", "content": prompt}
+        ])
         
-        result = response.choices[0].message.content.strip()
+        result = response.content.strip()
         
         # Save prompt and response to fixed file
         output_file = os.path.join(os.path.dirname(__file__), "..", "prompts_out", "field_suggestion_prompt.txt")

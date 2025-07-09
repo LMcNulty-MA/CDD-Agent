@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 from app.core.models import HealthResponse
+import os
 
 router = APIRouter()
 router.tags = ['Health monitoring']
@@ -14,15 +15,18 @@ router.tags = ['Health monitoring']
             'application/json': {
                 'example': {
                     'status': 'OK',
-                    'version': '1.0.0'
+                    'version': open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "ver.txt")).read().strip() if os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "ver.txt")) else "unknown"
                 }
             }
         }
     }}
 )
 async def ping():
+    # Read version from the root ver.txt file
+    root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ver_path = os.path.join(root_dir, "ver.txt")
     try:
-        with open("ver.txt", "r") as f:
+        with open(ver_path, "r") as f:
             version = f.read().strip()
         return HealthResponse(status="OK", version=version)
     except FileNotFoundError:

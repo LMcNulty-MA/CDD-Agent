@@ -1,7 +1,6 @@
 pandas==2.2.3
 jupyterlab
 jupytext
-openai
 keyboard
 python-dotenv
 openpyxl==3.1.5
@@ -15,3 +14,4 @@ requests==2.32.3
 cryptography==43.0.3
 PyJWT==2.10.1
 python-multipart
+langchain-openai

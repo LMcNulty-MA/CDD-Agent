@@ -8,7 +8,7 @@ AI-powered agent for help find matching CDD fields or add new fields
 
 3. Make a copy of .env.example in the root of the directory and name it '.env'
    - Contact the lead developer for the values for all fields that have 'XXX'
-    - Ex. 'OPENAI_API_KEY'
+    - Ex. 'AZURE_OPENAI_API_KEY'
 
 
 4. Create a virtual environment using python 3.13:

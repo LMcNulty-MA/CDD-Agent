@@ -421,8 +421,16 @@ async function loadNextField() {
         console.log('📥 Next field response:', data);
         
         if (data.status === 'completed') {
-            // Session completed
+            // Session completed - ensure progress shows full completion
             console.log('🎉 Session completed, showing results');
+            console.log('Completion progress data:', data.progress);
+            
+            // Force completion progress to show x/x regardless of backend numbers
+            if (data.progress && data.progress.total) {
+                console.log('Setting completion progress to:', data.progress.total, '/', data.progress.total);
+                updateProgressBar(data.progress.total, data.progress.total);
+            }
+            
             showElement('sessionCompleted');
             hideElement('currentFieldSection');
             return;
@@ -432,9 +440,18 @@ async function loadNextField() {
         currentFieldData = data.current_field;
         console.log('💾 Stored current field data:', currentFieldData);
         
-        // Update progress
+        // Update progress and check for completion
         if (data.progress) {
             updateProgressBar(data.progress.total, data.progress.processed);
+            
+            // Additional check: if processed equals total, we're done
+            if (data.progress.processed >= data.progress.total && data.progress.total > 0) {
+                console.log('🎯 Detected completion based on progress numbers:', data.progress.processed, '>=', data.progress.total);
+                updateProgressBar(data.progress.total, data.progress.total);
+                showElement('sessionCompleted');
+                hideElement('currentFieldSection');
+                return;
+            }
         }
         
         // Update batch size from server response
@@ -644,7 +661,7 @@ async function improveNewField() {
             body: JSON.stringify({
                 field_name: currentFieldData.field_name,
                 field_definition: currentFieldData.field_definition,
-                action_type: 'improve_new_field',
+                action_type: 'create_new_field',
                 feedback_text: feedbackText
             })
         });
@@ -658,6 +675,7 @@ async function improveNewField() {
             displayNewFieldSuggestion(result.new_field_suggestion);
             // Clear feedback after applying
             document.getElementById('bulkNewFieldFeedback').value = '';
+            showAlert('uploadStatus', 'New field suggestion updated with your feedback!', 'success');
         } else {
             console.error('Error improving new field:', result);
             showAlert('uploadStatus', 'Failed to improve new field', 'error');
@@ -770,6 +788,11 @@ async function acceptMatch(index) {
         
         // Hide matches section
         hideElement('matchesSection');
+        
+        // Update progress if available in response
+        if (result.progress) {
+            updateProgressBar(result.progress.total || 0, result.progress.processed || 0);
+        }
         
         // Move to next field
         await loadNextField();
@@ -900,6 +923,9 @@ function exitProcessing() {
     if (confirm('Are you sure you want to exit? This will clear your current session and you will lose any unsaved progress.')) {
         // Clear the session on the server
         clearSession().then(() => {
+            // Hide the entire processing interface (this contains the progress bar)
+            hideElement('processingInterface');
+            
             // Reset UI state
             hideElement('currentFieldSection');
             hideElement('sessionCompleted');
@@ -907,6 +933,9 @@ function exitProcessing() {
             hideElement('matchesSection');
             hideElement('newFieldSection');
             showElement('fileUploadSection');
+            
+            // Reset progress bar
+            updateProgressBar(0, 0);
             
             // Reset file input
             const fileInput = document.getElementById('fileInput');
@@ -917,6 +946,12 @@ function exitProcessing() {
             
             // Clear any existing alerts
             hideElement('uploadStatus');
+            
+            // Clear feedback inputs
+            const bulkMatchFeedback = document.getElementById('bulkMatchFeedback');
+            const bulkNewFieldFeedback = document.getElementById('bulkNewFieldFeedback');
+            if (bulkMatchFeedback) bulkMatchFeedback.value = '';
+            if (bulkNewFieldFeedback) bulkNewFieldFeedback.value = '';
             
             console.log('✅ Processing session ended and cleaned up');
         });
@@ -1183,7 +1218,7 @@ async function improveSingleFieldNewField() {
             body: JSON.stringify({
                 field_name: fieldName,
                 field_definition: fieldDefinition,
-                action_type: 'improve_new_field',
+                action_type: 'create_new_field',
                 feedback_text: feedback
             })
         });
@@ -1441,6 +1476,11 @@ async function acceptNewField() {
         // Hide new field section
         hideElement('newFieldSection');
         
+        // Update progress if available in response
+        if (result.progress) {
+            updateProgressBar(result.progress.total || 0, result.progress.processed || 0);
+        }
+        
         // Move to next field
         await loadNextField();
     } catch (error) {
@@ -1493,6 +1533,11 @@ async function skipField() {
         // Hide both sections
         hideElement('matchesSection');
         hideElement('newFieldSection');
+        
+        // Update progress if available in response
+        if (result.progress) {
+            updateProgressBar(result.progress.total || 0, result.progress.processed || 0);
+        }
         
         // Move to next field
         await loadNextField();
